@@ -1,0 +1,72 @@
+name: Build Telemost slot recovery patch
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.1'
+          cache-dependency-path: relay/go.sum
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK and Go mobile tools
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;29.0.14206865'
+          go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260508232728-bebd421c7fa8
+          go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260508232728-bebd421c7fa8
+          gomobile init
+
+      - name: Format and test Go code
+        run: |
+          gofmt -w headless/telemost/main.go relay/pion/headless-joiner-common/telemost_joiner.go
+          go -C relay test ./...
+          git diff --check
+
+      - name: Build Linux creator
+        run: |
+          mkdir -p artifacts
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go -C headless/telemost build \
+            -trimpath -ldflags='-s -w' \
+            -o ../../artifacts/headless-telemost-creator-slotfix .
+
+      - name: Build Android relay
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
+          export CGO_LDFLAGS='-Wl,-z,max-page-size=16384'
+          cd relay
+          gomobile bind -v -trimpath -ldflags='-s -w' \
+            -target=android -androidapi 23 -o mobile.aar ./androidbind/
+          mkdir -p ../android-app/app/libs
+          cp mobile.aar ../android-app/app/libs/mobile.aar
+          GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' \
+            -o ../android-app/app/src/main/jniLibs/arm64-v8a/librelay.so .
+          GOOS=linux GOARCH=arm go build -trimpath -ldflags='-s -w' \
+            -o ../android-app/app/src/main/jniLibs/armeabi-v7a/librelay.so .
+
+      - name: Build Android APK
+        run: |
+          sed -i 's/val versionPatch = 6/val versionPatch = 8/' android-app/app/build.gradle.kts
+          cd android-app
+          chmod +x gradlew
+          ./gradlew assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk \
+            ../artifacts/whitelist-bypass-0.3.8-slotfix.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: telemost-slotfix
+          path: artifacts/*
+          if-no-files-found: error
