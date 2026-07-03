@@ -285,9 +285,12 @@ func (b *Bridge) startSlotRecovery() {
 	gen := b.slotRecoveryGen
 	b.slotMu.Unlock()
 
-	log.Printf("[bind] video slot lost - requesting rebinding before reconnect")
+	log.Printf("[bind] video slot lost - requesting rebinding")
 	go func() {
-		const attempts = 8
+		// The joiner owns the fallback reconnect. Keeping the creator in the room
+		// avoids both peers replacing their IDs at the same time and creating a
+		// reconnect loop. Continue requesting slots while the joiner republishes.
+		const attempts = 20
 		for attempt := 1; attempt <= attempts; attempt++ {
 			b.requestVideoSlots()
 			timer := time.NewTimer(time.Second)
@@ -308,7 +311,7 @@ func (b *Bridge) startSlotRecovery() {
 		}
 		b.slotRecovering = false
 		b.slotMu.Unlock()
-		b.forceReconnect("video slot unavailable after recovery grace")
+		log.Printf("[bind] video slot still unavailable - waiting for peer republish")
 	}()
 }
 
