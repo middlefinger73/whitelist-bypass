@@ -586,9 +586,11 @@ func (j *TelemostHeadlessJoiner) startSlotRecovery() {
 	gen := j.slotRecoveryGen
 	j.boundMu.Unlock()
 
-	j.logFn("telemost-joiner: [bind] video slot lost - requesting rebinding before reconnect")
+	j.logFn("telemost-joiner: [bind] video slot lost - requesting rebinding")
 	go func() {
-		const attempts = 8
+		// Creator reconnects are authoritative. Keep the Android peer ID stable
+		// so the creator can resubscribe without triggering a reconnect cascade.
+		const attempts = 20
 		for attempt := 1; attempt <= attempts; attempt++ {
 			j.requestVideoSlots()
 			timer := time.NewTimer(time.Second)
@@ -614,7 +616,7 @@ func (j *TelemostHeadlessJoiner) startSlotRecovery() {
 		}
 		j.slotRecovering = false
 		j.boundMu.Unlock()
-		j.forceReconnect("video slot unavailable after recovery grace")
+		j.logFn("telemost-joiner: [bind] video slot still unavailable - waiting for creator republish")
 	}()
 }
 
