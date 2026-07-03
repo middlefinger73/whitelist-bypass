@@ -89,6 +89,8 @@ type TelemostHeadlessJoiner struct {
 	boundPeers      map[string]bool
 	unboundPeers    map[string]bool
 	boundMu         sync.Mutex
+	slotRecoveryGen uint64
+	slotRecovering  bool
 }
 
 func NewTelemostHeadlessJoiner(logFn func(string, ...any), resolveFn ResolveFunc, status StatusEmitter, pcConfig PeerConnectionConfigurer, addTracks AddTunnelTracksFunc, readTrackFn ReadTrackFunc) *TelemostHeadlessJoiner {
@@ -202,6 +204,8 @@ func (j *TelemostHeadlessJoiner) resetSessionState() {
 	j.boundMu.Lock()
 	j.boundPeers = nil
 	j.unboundPeers = nil
+	j.slotRecovering = false
+	j.slotRecoveryGen++
 	j.boundMu.Unlock()
 }
 
@@ -563,9 +567,55 @@ func (j *TelemostHeadlessJoiner) sendInitBundle() {
 }
 
 func (j *TelemostHeadlessJoiner) requestVideoSlots() {
+	j.boundMu.Lock()
 	j.setSlotsKey++
-	j.logFn("telemost-joiner: -> setSlots key=%d", j.setSlotsKey)
-	j.wsSend(tmapi.SetSlotsMessage(j.setSlotsKey))
+	key := j.setSlotsKey
+	j.boundMu.Unlock()
+	j.logFn("telemost-joiner: -> setSlots key=%d", key)
+	j.wsSend(tmapi.SetSlotsMessage(key))
+}
+
+func (j *TelemostHeadlessJoiner) startSlotRecovery() {
+	j.boundMu.Lock()
+	if j.slotRecovering {
+		j.boundMu.Unlock()
+		return
+	}
+	j.slotRecovering = true
+	j.slotRecoveryGen++
+	gen := j.slotRecoveryGen
+	j.boundMu.Unlock()
+
+	j.logFn("telemost-joiner: [bind] video slot lost - requesting rebinding before reconnect")
+	go func() {
+		const attempts = 8
+		for attempt := 1; attempt <= attempts; attempt++ {
+			j.requestVideoSlots()
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-timer.C:
+			case <-j.stopCh:
+				timer.Stop()
+				return
+			}
+
+			j.boundMu.Lock()
+			active := j.slotRecovering && j.slotRecoveryGen == gen
+			j.boundMu.Unlock()
+			if !active {
+				return
+			}
+		}
+
+		j.boundMu.Lock()
+		if !j.slotRecovering || j.slotRecoveryGen != gen {
+			j.boundMu.Unlock()
+			return
+		}
+		j.slotRecovering = false
+		j.boundMu.Unlock()
+		j.forceReconnect("video slot unavailable after recovery grace")
+	}()
 }
 
 func (j *TelemostHeadlessJoiner) forceReconnect(reason string) {
@@ -592,9 +642,12 @@ func (j *TelemostHeadlessJoiner) forceReconnect(reason string) {
 
 func (j *TelemostHeadlessJoiner) sendStartupSlotsRamp() {
 	for i := 0; i < 4; i++ {
+		j.boundMu.Lock()
 		j.setSlotsKey++
-		j.logFn("telemost-joiner: -> setSlots key=%d (startup %d/4)", j.setSlotsKey, i+1)
-		j.wsSend(tmapi.StartupSetSlotsMessage(i, j.setSlotsKey))
+		key := j.setSlotsKey
+		j.boundMu.Unlock()
+		j.logFn("telemost-joiner: -> setSlots key=%d (startup %d/4)", key, i+1)
+		j.wsSend(tmapi.StartupSetSlotsMessage(i, key))
 	}
 }
 
@@ -754,7 +807,7 @@ func (j *TelemostHeadlessJoiner) handleMessage(raw []byte) {
 
 	if sc, ok := msg["slotsConfig"]; ok {
 		j.logFn("telemost-joiner: <- slotsConfig %s", tmapi.BriefJSON(sc))
-		needRebind := false
+		lostBinding := false
 		presentPids := make(map[string]bool)
 		for _, ev := range tmapi.SlotsConfigBindings(sc) {
 			fullPid := ev.ParticipantID
@@ -773,7 +826,15 @@ func (j *TelemostHeadlessJoiner) handleMessage(raw []byte) {
 				}
 				j.boundPeers[fullPid] = true
 				delete(j.unboundPeers, fullPid)
+				recovered := j.slotRecovering
+				if recovered {
+					j.slotRecovering = false
+					j.slotRecoveryGen++
+				}
 				j.boundMu.Unlock()
+				if recovered {
+					j.logFn("telemost-joiner: [bind] video slot recovered without reconnect")
+				}
 			} else if fullPid != "" {
 				j.boundMu.Lock()
 				wasBound := j.boundPeers[fullPid]
@@ -786,8 +847,8 @@ func (j *TelemostHeadlessJoiner) handleMessage(raw []byte) {
 				}
 				j.boundMu.Unlock()
 				if wasBound {
-					j.logFn("telemost-joiner: [bind] KILL slot=%d pid=%s reason=%s - rebinding", ev.Slot, pid, ev.Reason)
-					needRebind = true
+					j.logFn("telemost-joiner: [bind] LOST slot=%d pid=%s reason=%s", ev.Slot, pid, ev.Reason)
+					lostBinding = true
 				} else {
 					j.logFn("telemost-joiner: [bind] UNBOUND slot=%d pid=%s reason=%s mid=%q", ev.Slot, pid, ev.Reason, ev.Mid)
 				}
@@ -800,14 +861,15 @@ func (j *TelemostHeadlessJoiner) handleMessage(raw []byte) {
 				if len(short) > 8 {
 					short = short[:8]
 				}
-				j.logFn("telemost-joiner: [bind] VANISHED pid=%s - rebinding", short)
+				j.logFn("telemost-joiner: [bind] VANISHED pid=%s", short)
 				delete(j.boundPeers, boundPid)
-				needRebind = true
+				lostBinding = true
 			}
 		}
+		hasBound := len(j.boundPeers) > 0
 		j.boundMu.Unlock()
-		if needRebind {
-			go j.forceReconnect("slot binding killed")
+		if lostBinding && !hasBound {
+			j.startSlotRecovery()
 		}
 		j.ack(uid)
 		return

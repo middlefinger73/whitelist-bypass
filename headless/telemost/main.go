@@ -63,6 +63,9 @@ type Bridge struct {
 	pendingKicks   map[string]chan struct{}
 	boundPeers     map[string]bool
 	unboundPeers   map[string]bool
+	slotMu          sync.Mutex
+	slotRecoveryGen uint64
+	slotRecovering  bool
 }
 
 func tmRequest(method, path string, body interface{}, cookieStr string, cfg TMConfig) ([]byte, int, error) {
@@ -254,9 +257,59 @@ func (b *Bridge) sendICE(cand *webrtc.ICECandidate, target string, pcSeq int) {
 }
 
 func (b *Bridge) requestVideoSlots() {
+	b.slotMu.Lock()
 	b.setSlotsKey++
-	log.Printf("[tm-ws] -> setSlots key=%d", b.setSlotsKey)
-	b.wsSend(tmapi.SetSlotsMessage(b.setSlotsKey))
+	key := b.setSlotsKey
+	b.slotMu.Unlock()
+	log.Printf("[tm-ws] -> setSlots key=%d", key)
+	b.wsSend(tmapi.SetSlotsMessage(key))
+}
+
+func (b *Bridge) resetSlotRecovery() {
+	b.slotMu.Lock()
+	b.boundPeers = nil
+	b.unboundPeers = nil
+	b.slotRecovering = false
+	b.slotRecoveryGen++
+	b.slotMu.Unlock()
+}
+
+func (b *Bridge) startSlotRecovery() {
+	b.slotMu.Lock()
+	if b.slotRecovering {
+		b.slotMu.Unlock()
+		return
+	}
+	b.slotRecovering = true
+	b.slotRecoveryGen++
+	gen := b.slotRecoveryGen
+	b.slotMu.Unlock()
+
+	log.Printf("[bind] video slot lost - requesting rebinding before reconnect")
+	go func() {
+		const attempts = 8
+		for attempt := 1; attempt <= attempts; attempt++ {
+			b.requestVideoSlots()
+			timer := time.NewTimer(time.Second)
+			<-timer.C
+
+			b.slotMu.Lock()
+			active := b.slotRecovering && b.slotRecoveryGen == gen
+			b.slotMu.Unlock()
+			if !active {
+				return
+			}
+		}
+
+		b.slotMu.Lock()
+		if !b.slotRecovering || b.slotRecoveryGen != gen {
+			b.slotMu.Unlock()
+			return
+		}
+		b.slotRecovering = false
+		b.slotMu.Unlock()
+		b.forceReconnect("video slot unavailable after recovery grace")
+	}()
 }
 
 func (b *Bridge) forceReconnect(reason string) {
@@ -291,9 +344,12 @@ func (b *Bridge) sendInitBundle() {
 
 func (b *Bridge) sendStartupSlotsRamp() {
 	for i := 0; i < 4; i++ {
+		b.slotMu.Lock()
 		b.setSlotsKey++
-		log.Printf("[tm-ws] -> setSlots key=%d (startup %d/4)", b.setSlotsKey, i+1)
-		b.wsSend(tmapi.StartupSetSlotsMessage(i, b.setSlotsKey))
+		key := b.setSlotsKey
+		b.slotMu.Unlock()
+		log.Printf("[tm-ws] -> setSlots key=%d (startup %d/4)", key, i+1)
+		b.wsSend(tmapi.StartupSetSlotsMessage(i, key))
 	}
 }
 
@@ -441,7 +497,7 @@ func (b *Bridge) handleMessage(raw []byte) {
 
 	if sc, ok := msg["slotsConfig"]; ok {
 		log.Printf("[tm-ws] <- slotsConfig %s", tmapi.BriefJSON(sc))
-		needRebind := false
+		lostBinding := false
 		presentPids := make(map[string]bool)
 		for _, ev := range tmapi.SlotsConfigBindings(sc) {
 			fullPid := ev.ParticipantID
@@ -454,15 +510,23 @@ func (b *Bridge) handleMessage(raw []byte) {
 			}
 			if ev.Reason == "NO_LIMITATION" && ev.Mid != "" {
 				log.Printf("[bind] BOUND slot=%d pid=%s mid=%s", ev.Slot, pid, ev.Mid)
-				b.mu.Lock()
+				b.slotMu.Lock()
 				if b.boundPeers == nil {
 					b.boundPeers = make(map[string]bool)
 				}
 				b.boundPeers[fullPid] = true
 				delete(b.unboundPeers, fullPid)
-				b.mu.Unlock()
+				recovered := b.slotRecovering
+				if recovered {
+					b.slotRecovering = false
+					b.slotRecoveryGen++
+				}
+				b.slotMu.Unlock()
+				if recovered {
+					log.Printf("[bind] video slot recovered without reconnect")
+				}
 			} else if fullPid != "" {
-				b.mu.Lock()
+				b.slotMu.Lock()
 				wasBound := b.boundPeers[fullPid]
 				if wasBound {
 					if b.unboundPeers == nil {
@@ -471,30 +535,31 @@ func (b *Bridge) handleMessage(raw []byte) {
 					b.unboundPeers[fullPid] = true
 					delete(b.boundPeers, fullPid)
 				}
-				b.mu.Unlock()
+				b.slotMu.Unlock()
 				if wasBound {
-					log.Printf("[bind] KILL slot=%d pid=%s reason=%s - rebinding", ev.Slot, pid, ev.Reason)
-					needRebind = true
+					log.Printf("[bind] LOST slot=%d pid=%s reason=%s", ev.Slot, pid, ev.Reason)
+					lostBinding = true
 				} else {
 					log.Printf("[bind] UNBOUND slot=%d pid=%s reason=%s mid=%q", ev.Slot, pid, ev.Reason, ev.Mid)
 				}
 			}
 		}
-		b.mu.Lock()
+		b.slotMu.Lock()
 		for boundPid := range b.boundPeers {
 			if !presentPids[boundPid] {
 				short := boundPid
 				if len(short) > 8 {
 					short = short[:8]
 				}
-				log.Printf("[bind] VANISHED pid=%s - rebinding", short)
+				log.Printf("[bind] VANISHED pid=%s", short)
 				delete(b.boundPeers, boundPid)
-				needRebind = true
+				lostBinding = true
 			}
 		}
-		b.mu.Unlock()
-		if needRebind {
-			go b.forceReconnect("slot binding killed")
+		hasBound := len(b.boundPeers) > 0
+		b.slotMu.Unlock()
+		if lostBinding && !hasBound {
+			b.startSlotRecovery()
 		}
 		b.ack(uid)
 		return
@@ -689,6 +754,7 @@ func (b *Bridge) pollAndAdmit() {
 }
 
 func (b *Bridge) initRelay() {
+	b.resetSlotRecovery()
 	if b.relay != nil {
 		b.relay.Close()
 	}
