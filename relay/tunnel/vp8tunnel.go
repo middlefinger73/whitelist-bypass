@@ -13,6 +13,7 @@ const (
 	defaultVP8FPS       = 24
 	defaultVP8Batch     = 30
 	keepaliveIdlePeriod = 100 * time.Millisecond
+	keyframePeriod      = 2 * time.Second
 	sendQueueDepth      = 128
 )
 
@@ -157,6 +158,8 @@ func (t *VP8DataTunnel) writerLoop() {
 
 		ticker := time.NewTicker(sampleInterval)
 		idleTicks := 0
+		lastKeyframe := time.Time{}
+		forcedKeyframes := 0
 		reconfigure := false
 
 		for !reconfigure {
@@ -168,17 +171,27 @@ func (t *VP8DataTunnel) writerLoop() {
 				reconfigure = true
 			case <-ticker.C:
 				var sample []byte
-				select {
-				case data := <-t.sendQueue:
-					sample = t.obf.EncodeData(data)
-					idleTicks = 0
-				default:
-					idleTicks++
-					if idleTicks < keepaliveEvery {
-						continue
-					}
+				now := time.Now()
+				forceKeyframe := lastKeyframe.IsZero() || now.Sub(lastKeyframe) >= keyframePeriod
+				if forceKeyframe {
 					idleTicks = 0
 					sample = t.obf.EncodeKeepalive()
+					lastKeyframe = now
+					forcedKeyframes++
+				} else {
+					select {
+					case data := <-t.sendQueue:
+						sample = t.obf.EncodeData(data)
+						idleTicks = 0
+					default:
+						idleTicks++
+						if idleTicks < keepaliveEvery {
+							continue
+						}
+						idleTicks = 0
+						sample = t.obf.EncodeKeepalive()
+						lastKeyframe = now
+					}
 				}
 				if sample == nil {
 					continue
@@ -188,6 +201,9 @@ func (t *VP8DataTunnel) writerLoop() {
 					continue
 				}
 				n := t.sentFrames.Add(1)
+				if forceKeyframe && (forcedKeyframes <= 3 || forcedKeyframes%30 == 0) {
+					t.logFn("vp8tunnel: forced keyframe #%d at frame #%d", forcedKeyframes, n)
+				}
 				if n <= 5 || n%500 == 0 {
 					t.logFn("vp8tunnel: sent frame #%d size=%d", n, len(sample))
 				}

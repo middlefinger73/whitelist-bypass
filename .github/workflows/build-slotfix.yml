@@ -31,7 +31,8 @@ jobs:
 
       - name: Format and test Go code
         run: |
-          gofmt -w headless/telemost/main.go relay/pion/headless-joiner-common/telemost_joiner.go
+          gofmt -w headless/telemost/main.go relay/pion/headless-joiner-common/telemost_joiner.go \
+            relay/tunnel/vp8tunnel.go relay/common/version.go
           go -C relay test ./...
           git diff --check
 
@@ -58,12 +59,12 @@ jobs:
 
       - name: Build Android APK
         run: |
-          sed -i 's/val versionPatch = 6/val versionPatch = 8/' android-app/app/build.gradle.kts
+          sed -i 's/val versionPatch = 6/val versionPatch = 9/' android-app/app/build.gradle.kts
           cd android-app
           chmod +x gradlew
           ./gradlew assembleRelease
           cp app/build/outputs/apk/release/app-release.apk \
-            ../artifacts/whitelist-bypass-0.3.8-slotfix3.apk
+            ../artifacts/whitelist-bypass-0.3.9-slotfix4.apk
 
       - uses: actions/upload-artifact@v4
         with:
