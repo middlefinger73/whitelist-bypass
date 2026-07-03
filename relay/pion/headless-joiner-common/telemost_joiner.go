@@ -871,7 +871,7 @@ func (j *TelemostHeadlessJoiner) handleMessage(raw []byte) {
 		hasBound := len(j.boundPeers) > 0
 		j.boundMu.Unlock()
 		if lostBinding && !hasBound {
-			j.startSlotRecovery()
+			j.logFn("telemost-joiner: [bind] no video slot in current layout; keeping WebRTC session")
 		}
 		j.ack(uid)
 		return

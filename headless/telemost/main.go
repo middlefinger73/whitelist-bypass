@@ -561,7 +561,7 @@ func (b *Bridge) handleMessage(raw []byte) {
 		hasBound := len(b.boundPeers) > 0
 		b.slotMu.Unlock()
 		if lostBinding && !hasBound {
-			b.startSlotRecovery()
+			log.Printf("[bind] no video slot in current layout; keeping WebRTC session")
 		}
 		b.ack(uid)
 		return
