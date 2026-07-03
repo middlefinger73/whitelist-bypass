@@ -10,7 +10,7 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media"
 )
 
-var legacyVP8Keyframe = []byte{
+var vp8VideoKeyframe = []byte{
 	16, 2, 0, 157, 1, 42, 2, 0, 2, 0, 2, 7, 8, 133, 133, 136,
 	153, 132, 136, 11, 2, 0, 12, 13, 96, 0, 254, 252, 173, 16,
 }
@@ -184,7 +184,7 @@ func (t *VP8LegacyTunnel) writerLoop() {
 					}
 					idleTicks = 0
 					if (t.sentFrames.Load()+1)%legacyKeyframeEvery == 0 {
-						sample = legacyVP8Keyframe
+						sample = vp8VideoKeyframe
 					} else {
 						sample = legacyVP8Interframe
 					}

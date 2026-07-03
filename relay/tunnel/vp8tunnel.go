@@ -175,7 +175,7 @@ func (t *VP8DataTunnel) writerLoop() {
 				forceKeyframe := lastKeyframe.IsZero() || now.Sub(lastKeyframe) >= keyframePeriod
 				if forceKeyframe {
 					idleTicks = 0
-					sample = t.obf.EncodeKeepalive()
+					sample = vp8VideoKeyframe
 					lastKeyframe = now
 					forcedKeyframes++
 				} else {
@@ -190,7 +190,6 @@ func (t *VP8DataTunnel) writerLoop() {
 						}
 						idleTicks = 0
 						sample = t.obf.EncodeKeepalive()
-						lastKeyframe = now
 					}
 				}
 				if sample == nil {
