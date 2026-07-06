@@ -54,6 +54,7 @@ type VP8DataTunnel struct {
 	recvFrames atomic.Uint64
 
 	reliableSendMu sync.Mutex
+	outboundMu     sync.Mutex
 	nextSendSeq    uint32
 	pendingMu      sync.Mutex
 	pending        map[uint32]*reliablePendingPacket
@@ -348,6 +349,9 @@ func (t *VP8DataTunnel) HandlePayload(payload []byte) {
 }
 
 func (t *VP8DataTunnel) nextOutboundData(now time.Time) []byte {
+	t.outboundMu.Lock()
+	defer t.outboundMu.Unlock()
+
 	if !t.reliable.Load() {
 		select {
 		case data := <-t.sendQueue:
@@ -490,16 +494,40 @@ func (t *VP8DataTunnel) queueReliableAck(seq uint32, bitmap []byte) {
 	t.ackMu.Unlock()
 }
 
-// ResetReliablePeer drops receive reordering state after a real process restart.
+// ResetReliablePeer starts a fresh reliable session after a real process restart.
 // Publisher PC rotation keeps the same obfuscator epoch and does not call this.
 func (t *VP8DataTunnel) ResetReliablePeer() {
 	if !t.reliable.Load() {
 		return
 	}
+	t.reliableSendMu.Lock()
+	t.outboundMu.Lock()
+	t.pendingMu.Lock()
+	t.nextSendSeq = 1
+	clear(t.pending)
+	for {
+		select {
+		case <-t.sendQueue:
+		default:
+			t.pendingMu.Unlock()
+			t.outboundMu.Unlock()
+			t.reliableSendMu.Unlock()
+			goto sendReset
+		}
+	}
+
+sendReset:
+	t.ackMu.Lock()
+	t.ackSeq = 0
+	clear(t.ackBitmap[:])
+	t.ackDirty = false
+	t.lastAckSent = time.Time{}
+	t.ackMu.Unlock()
 	t.recvMu.Lock()
 	t.nextRecvSeq = 1
 	clear(t.recvPending)
 	t.recvMu.Unlock()
+	t.logFn("vp8tunnel: reliable peer state reset")
 }
 
 func encodeReliablePacket(kind byte, seq uint32, payload []byte) []byte {

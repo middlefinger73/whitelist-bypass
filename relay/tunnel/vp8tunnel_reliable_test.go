@@ -99,3 +99,24 @@ func TestReliableSendAssignsOrderedSequenceNumbers(t *testing.T) {
 		t.Fatalf("payloads = (%q, %q)", firstBody, secondBody)
 	}
 }
+
+func TestReliablePeerResetStartsSequenceFromOne(t *testing.T) {
+	tun := newReliableTestTunnel(t)
+	tun.SendData([]byte("stale queued"))
+	tun.pending[99] = &reliablePendingPacket{data: []byte("stale pending")}
+	tun.nextSendSeq = 100
+	tun.nextRecvSeq = 100
+	tun.recvPending[101] = []byte("stale received")
+
+	tun.ResetReliablePeer()
+	tun.SendData([]byte("fresh"))
+
+	packet := <-tun.sendQueue
+	_, seq, body, ok := decodeReliablePacket(packet)
+	if !ok || seq != 1 || string(body) != "fresh" {
+		t.Fatalf("first packet after reset: ok=%v seq=%d body=%q", ok, seq, body)
+	}
+	if len(tun.pending) != 0 || len(tun.recvPending) != 0 || tun.nextRecvSeq != 1 {
+		t.Fatalf("reset retained state: pending=%d recvPending=%d nextRecv=%d", len(tun.pending), len(tun.recvPending), tun.nextRecvSeq)
+	}
+}
