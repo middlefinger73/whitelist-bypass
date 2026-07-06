@@ -19,6 +19,7 @@ const (
 
 type VP8DataTunnel struct {
 	track     *webrtc.TrackLocalStaticSample
+	trackMu   sync.RWMutex
 	logFn     func(string, ...any)
 	obf       *TunnelObfuscator
 	stopCh    chan struct{}
@@ -37,6 +38,16 @@ type VP8DataTunnel struct {
 
 	OnData  func([]byte)
 	OnClose func()
+}
+
+func (t *VP8DataTunnel) SetTrack(track *webrtc.TrackLocalStaticSample) {
+	if track == nil {
+		return
+	}
+	t.trackMu.Lock()
+	t.track = track
+	t.trackMu.Unlock()
+	t.logFn("vp8tunnel: publisher track rotated")
 }
 
 func (t *VP8DataTunnel) SetOnData(fn func([]byte)) { t.OnData = fn }
@@ -195,7 +206,10 @@ func (t *VP8DataTunnel) writerLoop() {
 				if sample == nil {
 					continue
 				}
-				if err := t.track.WriteSample(media.Sample{Data: sample, Duration: sampleInterval}); err != nil {
+				t.trackMu.RLock()
+				track := t.track
+				t.trackMu.RUnlock()
+				if err := track.WriteSample(media.Sample{Data: sample, Duration: sampleInterval}); err != nil {
 					t.logFn("vp8tunnel: WriteSample error: %v", err)
 					continue
 				}

@@ -27,7 +27,7 @@ type SFURelay struct {
 	OnConnected   func(*tunnel.VP8DataTunnel)
 	OnPubReady    func()
 	OnPeerRestart func()
-	OnPubICE      func(*webrtc.ICECandidate)
+	OnPubICE      func(*webrtc.ICECandidate, int)
 	OnSubICE      func(*webrtc.ICECandidate)
 
 	readBufSize int
@@ -65,7 +65,7 @@ func (r *SFURelay) Init(iceServers []webrtc.ICEServer) error {
 		if cand == nil || r.OnPubICE == nil {
 			return
 		}
-		r.OnPubICE(cand)
+		r.OnPubICE(cand, 1)
 	})
 
 	pubPC.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -195,6 +195,76 @@ func (r *SFURelay) CreatePubRenegotiate() (webrtc.SessionDescription, error) {
 	}
 	offer.SDP = tmapi.MungeSDPAddVideoContent(offer.SDP)
 	r.mu.Lock()
+	r.pubRemoteSet = false
+	r.pubPending = nil
+	r.mu.Unlock()
+	return offer, nil
+}
+
+func (r *SFURelay) CreateRotatedPublisher(iceServers []webrtc.ICEServer, seq int) (webrtc.SessionDescription, error) {
+	config := webrtc.Configuration{ICEServers: iceServers}
+	pubPC, err := tmapi.NewPeerConnection(config)
+	if err != nil {
+		return webrtc.SessionDescription{}, err
+	}
+
+	sampleTrack, _ := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8},
+		"video", "tunnel-video",
+	)
+	audioTrack, _ := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+		"audio", "tunnel-audio",
+	)
+	pubPC.AddTransceiverFromTrack(audioTrack, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly})
+	pubPC.AddTransceiverFromTrack(sampleTrack, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly})
+
+	pubPC.OnICECandidate(func(cand *webrtc.ICECandidate) {
+		if cand != nil && r.OnPubICE != nil {
+			r.OnPubICE(cand, seq)
+		}
+	})
+
+	r.mu.Lock()
+	oldPubPC := r.pubPC
+	r.mu.Unlock()
+	pubPC.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		log.Printf("[pub-rotate] connection state: %s", state.String())
+		if state != webrtc.PeerConnectionStateConnected {
+			return
+		}
+		r.mu.Lock()
+		isCurrent := r.pubPC == pubPC
+		tun := r.tun
+		r.mu.Unlock()
+		if !isCurrent {
+			return
+		}
+		if tun != nil {
+			tun.SetTrack(sampleTrack)
+		}
+		if oldPubPC != nil {
+			oldPubPC.Close()
+		}
+		if r.OnPubReady != nil {
+			r.OnPubReady()
+		}
+	})
+
+	offer, err := pubPC.CreateOffer(nil)
+	if err != nil {
+		pubPC.Close()
+		return webrtc.SessionDescription{}, err
+	}
+	if err := pubPC.SetLocalDescription(offer); err != nil {
+		pubPC.Close()
+		return webrtc.SessionDescription{}, err
+	}
+	offer.SDP = tmapi.MungeSDPAddVideoContent(offer.SDP)
+
+	r.mu.Lock()
+	r.pubPC = pubPC
+	r.sampleTrack = sampleTrack
 	r.pubRemoteSet = false
 	r.pubPending = nil
 	r.mu.Unlock()

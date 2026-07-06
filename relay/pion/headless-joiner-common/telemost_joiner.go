@@ -64,6 +64,8 @@ type TelemostHeadlessJoiner struct {
 	pubRotateMu  sync.Mutex
 	pubRotateStop chan struct{}
 	pubRotateOn   bool
+	pcAPI         *webrtc.API
+	pcConfig      webrtc.Configuration
 
 	sampleTrack *webrtc.TrackLocalStaticSample
 	vp8tunnel   *tunnel.VP8DataTunnel
@@ -205,6 +207,8 @@ func (j *TelemostHeadlessJoiner) resetSessionState() {
 	j.pubSeq.Store(0)
 	j.pubRemoteSet = false
 	j.pubPending = nil
+	j.pcAPI = nil
+	j.pcConfig = webrtc.Configuration{}
 	j.pubSignalMu.Unlock()
 	j.sampleTrack = nil
 	j.vp8tunnel = nil
@@ -443,6 +447,8 @@ func (j *TelemostHeadlessJoiner) initPC() {
 		j.logFn("telemost-joiner: ERROR: create webrtc API: %v", err)
 		return
 	}
+	j.pcAPI = api
+	j.pcConfig = config
 
 	subPC, err := api.NewPeerConnection(config)
 	if err != nil {
@@ -549,25 +555,56 @@ func (j *TelemostHeadlessJoiner) sendPubOffer() {
 func (j *TelemostHeadlessJoiner) rotatePublisher() {
 	j.pubSignalMu.Lock()
 	defer j.pubSignalMu.Unlock()
-	if j.pubPC == nil {
-		return
-	}
-	if j.pubPC.SignalingState() != webrtc.SignalingStateStable {
-		j.logFn("telemost-joiner: [pub-rotate] skipped: signaling state=%s", j.pubPC.SignalingState())
+	if j.pubPC == nil || j.pcAPI == nil {
 		return
 	}
 
 	seq := int(j.pubSeq.Add(1))
-	offer, err := j.pubPC.CreateOffer(&webrtc.OfferOptions{ICERestart: false})
+	oldPubPC := j.pubPC
+	pubPC, err := j.pcAPI.NewPeerConnection(j.pcConfig)
 	if err != nil {
+		j.logFn("telemost-joiner: [pub-rotate] create PC: %v", err)
+		return
+	}
+	sampleTrack := j.AddTracks(pubPC, j.logFn, "telemost-joiner [pub-rotate]")
+	pubPC.OnICECandidate(func(cand *webrtc.ICECandidate) {
+		if cand != nil {
+			j.sendICE(cand, "PUBLISHER", seq)
+		}
+	})
+	pubPC.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		j.logFn("telemost-joiner: [pub-rotate] PC state: %s", state.String())
+		if state != webrtc.PeerConnectionStateConnected {
+			return
+		}
+		j.pubSignalMu.Lock()
+		isCurrent := j.pubPC == pubPC
+		j.pubSignalMu.Unlock()
+		if !isCurrent {
+			return
+		}
+		if j.vp8tunnel != nil {
+			j.vp8tunnel.SetTrack(sampleTrack)
+		}
+		if oldPubPC != nil {
+			oldPubPC.Close()
+		}
+	})
+
+	offer, err := pubPC.CreateOffer(nil)
+	if err != nil {
+		pubPC.Close()
 		j.logFn("telemost-joiner: [pub-rotate] offer failed: %v", err)
 		return
 	}
-	if err := j.pubPC.SetLocalDescription(offer); err != nil {
+	if err := pubPC.SetLocalDescription(offer); err != nil {
+		pubPC.Close()
 		j.logFn("telemost-joiner: [pub-rotate] set local description: %v", err)
 		return
 	}
 	offer.SDP = tmapi.MungeSDPAddVideoContent(offer.SDP)
+	j.pubPC = pubPC
+	j.sampleTrack = sampleTrack
 	j.pubRemoteSet = false
 	j.pubPending = nil
 	j.initBundleSent = false
@@ -827,6 +864,7 @@ func (j *TelemostHeadlessJoiner) handleMessage(raw []byte) {
 		candidate, _ := icMap["candidate"].(string)
 		sdpMid, _ := icMap["sdpMid"].(string)
 		target, _ := icMap["target"].(string)
+		pcSeq, _ := icMap["pcSeq"].(float64)
 		sdpIdx, _ := icMap["sdpMlineIndex"].(float64)
 		idx := uint16(sdpIdx)
 		cand := webrtc.ICECandidateInit{Candidate: candidate, SDPMid: &sdpMid, SDPMLineIndex: &idx}
@@ -846,6 +884,10 @@ func (j *TelemostHeadlessJoiner) handleMessage(raw []byte) {
 				j.subPending = append(j.subPending, cand)
 			}
 		} else if target == "PUBLISHER" {
+			if int(pcSeq) != int(j.pubSeq.Load()) {
+				j.ack(uid)
+				return
+			}
 			j.pubSignalMu.Lock()
 			if j.pubRemoteSet {
 				j.pubPC.AddICECandidate(cand)

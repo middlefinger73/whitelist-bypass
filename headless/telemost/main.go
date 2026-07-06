@@ -250,13 +250,9 @@ func (b *Bridge) rotatePublisher(relay *SFURelay) {
 	if b.relay != relay || relay.pubPC == nil {
 		return
 	}
-	if relay.pubPC.SignalingState() != webrtc.SignalingStateStable {
-		log.Printf("[pub-rotate] skipped: signaling state=%s", relay.pubPC.SignalingState())
-		return
-	}
 
 	seq := int(b.pubSeq.Add(1))
-	offer, err := relay.CreatePubRenegotiate()
+	offer, err := relay.CreateRotatedPublisher(b.connInfo.ICEServers, seq)
 	if err != nil {
 		log.Printf("[pub-rotate] offer failed: %v", err)
 		return
@@ -489,10 +485,15 @@ func (b *Bridge) handleMessage(raw []byte) {
 		candidate, _ := icMap["candidate"].(string)
 		sdpMid, _ := icMap["sdpMid"].(string)
 		target, _ := icMap["target"].(string)
+		pcSeq, _ := icMap["pcSeq"].(float64)
 		sdpIdx, _ := icMap["sdpMlineIndex"].(float64)
 		idx := uint16(sdpIdx)
 		cand := webrtc.ICECandidateInit{Candidate: candidate, SDPMid: &sdpMid, SDPMLineIndex: &idx}
 		if target == "PUBLISHER" {
+			if int(pcSeq) != int(b.pubSeq.Load()) {
+				b.ack(uid)
+				return
+			}
 			b.relay.AddPubICECandidate(cand)
 		} else {
 			b.relay.AddSubICECandidate(cand)
@@ -868,11 +869,11 @@ func (b *Bridge) initRelay() {
 			b.activeBridge.Reset()
 		}
 	}
-	relay.OnPubICE = func(cand *webrtc.ICECandidate) {
+	relay.OnPubICE = func(cand *webrtc.ICECandidate, seq int) {
 		if cand == nil {
 			return
 		}
-		b.sendICE(cand, "PUBLISHER", int(b.pubSeq.Load()))
+		b.sendICE(cand, "PUBLISHER", seq)
 	}
 	relay.OnSubICE = func(cand *webrtc.ICECandidate) {
 		if cand == nil {
