@@ -4,6 +4,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"whitelist-bypass/relay/common"
 )
 
 func newReliableTestTunnel(t *testing.T) *VP8DataTunnel {
@@ -11,6 +13,20 @@ func newReliableTestTunnel(t *testing.T) *VP8DataTunnel {
 	tun := NewVP8DataTunnel(nil, nil, t.Logf)
 	tun.EnableReliableDelivery()
 	return tun
+}
+
+func TestReliableMaxRelayPayloadFitsOneMediaPacket(t *testing.T) {
+	obf, err := NewTunnelObfuscator([]byte("test-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	relayFrame := EncodeFrame(1, MsgData, make([]byte, common.VP8BufSize))
+	reliableFrame := encodeReliablePacket(reliableKindData, 1, relayFrame)
+	mediaPayload := obf.EncodeData(reliableFrame)
+
+	if len(mediaPayload) > 1200 {
+		t.Fatalf("encrypted media payload = %d bytes, want <= 1200", len(mediaPayload))
+	}
 }
 
 func TestReliableDeliveryReordersAndDeduplicates(t *testing.T) {
