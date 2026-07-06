@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -48,7 +49,7 @@ type Bridge struct {
 	connInfo      *ConnInfo
 	config        TMConfig
 	cookieStr     string
-	pubSeq        int
+	pubSeq        atomic.Int32
 	subSeq        int
 	peers         map[string]string
 	readBuf       int
@@ -57,6 +58,8 @@ type Bridge struct {
 	upstreamSocks string
 	upstreamUser  string
 	upstreamPass  string
+	pubMu         sync.Mutex
+	pubRotateStop chan struct{}
 
 	setSlotsKey    int
 	initBundleSent bool
@@ -67,6 +70,8 @@ type Bridge struct {
 	slotRecoveryGen uint64
 	slotRecovering  bool
 }
+
+const publisherRotationPeriod = 35 * time.Second
 
 func tmRequest(method, path string, body interface{}, cookieStr string, cfg TMConfig) ([]byte, int, error) {
 	c := tmapi.Client{Cookie: cookieStr, AppVersion: cfg.AppVersion, InstanceID: clientInstanceID}
@@ -215,13 +220,16 @@ func (b *Bridge) sendHello() {
 }
 
 func (b *Bridge) sendPubOffer() {
+	b.pubMu.Lock()
+	defer b.pubMu.Unlock()
 	offer, err := b.relay.CreatePubOffer()
 	if err != nil {
 		log.Printf("[tm-ws] pub offer failed: %v", err)
 		return
 	}
 	audioMid, videoMid := parseMids(offer.SDP)
-	log.Printf("[tm-ws] -> publisherSdpOffer pcSeq=%d", b.pubSeq)
+	seq := int(b.pubSeq.Load())
+	log.Printf("[tm-ws] -> publisherSdpOffer pcSeq=%d", seq)
 
 	var tracks []map[string]interface{}
 	if audioMid != "" {
@@ -232,8 +240,75 @@ func (b *Bridge) sendPubOffer() {
 	}
 	b.wsSend(map[string]interface{}{
 		"uid":               uuid.New().String(),
-		"publisherSdpOffer": map[string]interface{}{"pcSeq": b.pubSeq, "sdp": offer.SDP, "tracks": tracks},
+		"publisherSdpOffer": map[string]interface{}{"pcSeq": seq, "sdp": offer.SDP, "tracks": tracks},
 	})
+}
+
+func (b *Bridge) rotatePublisher(relay *SFURelay) {
+	b.pubMu.Lock()
+	defer b.pubMu.Unlock()
+	if b.relay != relay || relay.pubPC == nil {
+		return
+	}
+	if relay.pubPC.SignalingState() != webrtc.SignalingStateStable {
+		log.Printf("[pub-rotate] skipped: signaling state=%s", relay.pubPC.SignalingState())
+		return
+	}
+
+	seq := int(b.pubSeq.Add(1))
+	offer, err := relay.CreatePubRenegotiate()
+	if err != nil {
+		log.Printf("[pub-rotate] offer failed: %v", err)
+		return
+	}
+	b.initBundleSent = false
+	audioMid, videoMid := parseMids(offer.SDP)
+	log.Printf("[pub-rotate] -> publisherSdpOffer pcSeq=%d audioMid=%s videoMid=%s", seq, audioMid, videoMid)
+
+	var tracks []map[string]interface{}
+	if audioMid != "" {
+		tracks = append(tracks, map[string]interface{}{"mid": audioMid, "transceiverMid": audioMid, "kind": "AUDIO", "priority": 0, "label": "", "codecs": map[string]interface{}{}, "groupId": 1, "description": ""})
+	}
+	if videoMid != "" {
+		tracks = append(tracks, map[string]interface{}{"mid": videoMid, "transceiverMid": videoMid, "kind": "VIDEO", "priority": 0, "label": "", "codecs": map[string]interface{}{}, "groupId": 2, "description": ""})
+	}
+	b.wsSend(map[string]interface{}{
+		"uid":               uuid.New().String(),
+		"publisherSdpOffer": map[string]interface{}{"pcSeq": seq, "sdp": offer.SDP, "tracks": tracks},
+	})
+}
+
+func (b *Bridge) startPublisherRotation(relay *SFURelay) {
+	b.pubMu.Lock()
+	if b.pubRotateStop != nil {
+		b.pubMu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	b.pubRotateStop = stop
+	b.pubMu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(publisherRotationPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				b.rotatePublisher(relay)
+			}
+		}
+	}()
+}
+
+func (b *Bridge) stopPublisherRotation() {
+	b.pubMu.Lock()
+	if b.pubRotateStop != nil {
+		close(b.pubRotateStop)
+		b.pubRotateStop = nil
+	}
+	b.pubMu.Unlock()
 }
 
 func (b *Bridge) sendICE(cand *webrtc.ICECandidate, target string, pcSeq int) {
@@ -334,6 +409,8 @@ func (b *Bridge) forceReconnect(reason string) {
 }
 
 func (b *Bridge) sendInitBundle() {
+	b.pubMu.Lock()
+	defer b.pubMu.Unlock()
 	if b.initBundleSent {
 		return
 	}
@@ -756,11 +833,12 @@ func (b *Bridge) pollAndAdmit() {
 }
 
 func (b *Bridge) initRelay() {
+	b.stopPublisherRotation()
 	b.resetSlotRecovery()
 	if b.relay != nil {
 		b.relay.Close()
 	}
-	b.pubSeq = 1
+	b.pubSeq.Store(1)
 	b.subSeq = 0
 	b.initBundleSent = false
 
@@ -774,6 +852,7 @@ func (b *Bridge) initRelay() {
 	log.Printf("[relay] obfuscator localEpoch=0x%08x", obf.LocalEpoch())
 	relay.OnPubReady = func() {
 		log.Printf("[relay] pub PC connected")
+		b.startPublisherRotation(relay)
 	}
 	relay.OnConnected = func(tun *tunnel.VP8DataTunnel) {
 		if b.activeBridge != nil {
@@ -793,7 +872,7 @@ func (b *Bridge) initRelay() {
 		if cand == nil {
 			return
 		}
-		b.sendICE(cand, "PUBLISHER", b.pubSeq)
+		b.sendICE(cand, "PUBLISHER", int(b.pubSeq.Load()))
 	}
 	relay.OnSubICE = func(cand *webrtc.ICECandidate) {
 		if cand == nil {
@@ -896,6 +975,7 @@ func (b *Bridge) run() {
 		close(stopPing)
 		close(stopStateKeepalive)
 		close(stopWaitingRoomPoll)
+		b.stopPublisherRotation()
 		b.mu.Lock()
 		b.ws = nil
 		b.mu.Unlock()

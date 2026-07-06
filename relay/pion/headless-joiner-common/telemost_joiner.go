@@ -27,6 +27,7 @@ const (
 	TmPingPeriod                  = 5 * time.Second
 	telemostReconnectInitialDelay = time.Second
 	telemostReconnectMaxDelay     = 16 * time.Second
+	telemostPublisherRotationPeriod = 35 * time.Second
 )
 
 type TelemostHeadlessJoiner struct {
@@ -56,9 +57,13 @@ type TelemostHeadlessJoiner struct {
 	subPending   []webrtc.ICECandidateInit
 
 	pubPC        *webrtc.PeerConnection
-	pubSeq       int
+	pubSeq       atomic.Int32
 	pubRemoteSet bool
 	pubPending   []webrtc.ICECandidateInit
+	pubSignalMu  sync.Mutex
+	pubRotateMu  sync.Mutex
+	pubRotateStop chan struct{}
+	pubRotateOn   bool
 
 	sampleTrack *webrtc.TrackLocalStaticSample
 	vp8tunnel   *tunnel.VP8DataTunnel
@@ -187,6 +192,7 @@ func (j *TelemostHeadlessJoiner) waitBeforeRetry(attempt int) bool {
 }
 
 func (j *TelemostHeadlessJoiner) resetSessionState() {
+	j.stopPublisherRotation()
 	j.wsMu.Lock()
 	j.ws = nil
 	j.wsMu.Unlock()
@@ -194,10 +200,12 @@ func (j *TelemostHeadlessJoiner) resetSessionState() {
 	j.subSeq = 0
 	j.subRemoteSet = false
 	j.subPending = nil
+	j.pubSignalMu.Lock()
 	j.pubPC = nil
-	j.pubSeq = 0
+	j.pubSeq.Store(0)
 	j.pubRemoteSet = false
 	j.pubPending = nil
+	j.pubSignalMu.Unlock()
 	j.sampleTrack = nil
 	j.vp8tunnel = nil
 	j.initBundleSent = false
@@ -214,6 +222,7 @@ func (j *TelemostHeadlessJoiner) Close() {
 	j.closed = true
 	j.closeMu.Unlock()
 	j.stopOnce.Do(func() { close(j.stopCh) })
+	j.stopPublisherRotation()
 	j.wsMu.Lock()
 	ws := j.ws
 	j.ws = nil
@@ -471,13 +480,14 @@ func (j *TelemostHeadlessJoiner) initPC() {
 		return
 	}
 	j.pubPC = pubPC
-	j.pubSeq = 1
+	j.pubSeq.Store(1)
 
 	j.sampleTrack = j.AddTracks(pubPC, j.logFn, "telemost-joiner [pub]")
 
 	pubPC.OnICECandidate(func(cand *webrtc.ICECandidate) {
 		if cand != nil {
-			j.sendICE(cand, "PUBLISHER", j.pubSeq)
+			seq := int(j.pubSeq.Load())
+			j.sendICE(cand, "PUBLISHER", seq)
 		}
 	})
 
@@ -494,6 +504,7 @@ func (j *TelemostHeadlessJoiner) initPC() {
 			if j.OnConnected != nil {
 				j.OnConnected(j.vp8tunnel)
 			}
+			j.startPublisherRotation()
 		}
 	})
 
@@ -501,6 +512,8 @@ func (j *TelemostHeadlessJoiner) initPC() {
 }
 
 func (j *TelemostHeadlessJoiner) sendPubOffer() {
+	j.pubSignalMu.Lock()
+	defer j.pubSignalMu.Unlock()
 	if j.pubPC == nil {
 		return
 	}
@@ -517,7 +530,8 @@ func (j *TelemostHeadlessJoiner) sendPubOffer() {
 	offer.SDP = tmapi.MungeSDPAddVideoContent(offer.SDP)
 
 	audioMid, videoMid := TmParseMids(offer.SDP)
-	j.logFn("telemost-joiner: -> publisherSdpOffer pcSeq=%d audioMid=%s videoMid=%s", j.pubSeq, audioMid, videoMid)
+	seq := int(j.pubSeq.Load())
+	j.logFn("telemost-joiner: -> publisherSdpOffer pcSeq=%d audioMid=%s videoMid=%s", seq, audioMid, videoMid)
 
 	var tracks []map[string]interface{}
 	if audioMid != "" {
@@ -528,11 +542,89 @@ func (j *TelemostHeadlessJoiner) sendPubOffer() {
 	}
 	j.wsSend(map[string]interface{}{
 		"uid":               uuid.New().String(),
-		"publisherSdpOffer": map[string]interface{}{"pcSeq": j.pubSeq, "sdp": offer.SDP, "tracks": tracks},
+		"publisherSdpOffer": map[string]interface{}{"pcSeq": seq, "sdp": offer.SDP, "tracks": tracks},
 	})
 }
 
+func (j *TelemostHeadlessJoiner) rotatePublisher() {
+	j.pubSignalMu.Lock()
+	defer j.pubSignalMu.Unlock()
+	if j.pubPC == nil {
+		return
+	}
+	if j.pubPC.SignalingState() != webrtc.SignalingStateStable {
+		j.logFn("telemost-joiner: [pub-rotate] skipped: signaling state=%s", j.pubPC.SignalingState())
+		return
+	}
+
+	seq := int(j.pubSeq.Add(1))
+	offer, err := j.pubPC.CreateOffer(&webrtc.OfferOptions{ICERestart: false})
+	if err != nil {
+		j.logFn("telemost-joiner: [pub-rotate] offer failed: %v", err)
+		return
+	}
+	if err := j.pubPC.SetLocalDescription(offer); err != nil {
+		j.logFn("telemost-joiner: [pub-rotate] set local description: %v", err)
+		return
+	}
+	offer.SDP = tmapi.MungeSDPAddVideoContent(offer.SDP)
+	j.pubRemoteSet = false
+	j.pubPending = nil
+	j.initBundleSent = false
+
+	audioMid, videoMid := TmParseMids(offer.SDP)
+	j.logFn("telemost-joiner: [pub-rotate] -> publisherSdpOffer pcSeq=%d audioMid=%s videoMid=%s", seq, audioMid, videoMid)
+	var tracks []map[string]interface{}
+	if audioMid != "" {
+		tracks = append(tracks, map[string]interface{}{"mid": audioMid, "transceiverMid": audioMid, "kind": "AUDIO", "priority": 0, "label": "", "codecs": map[string]interface{}{}, "groupId": 1, "description": ""})
+	}
+	if videoMid != "" {
+		tracks = append(tracks, map[string]interface{}{"mid": videoMid, "transceiverMid": videoMid, "kind": "VIDEO", "priority": 0, "label": "", "codecs": map[string]interface{}{}, "groupId": 2, "description": ""})
+	}
+	j.wsSend(map[string]interface{}{
+		"uid":               uuid.New().String(),
+		"publisherSdpOffer": map[string]interface{}{"pcSeq": seq, "sdp": offer.SDP, "tracks": tracks},
+	})
+}
+
+func (j *TelemostHeadlessJoiner) startPublisherRotation() {
+	j.pubRotateMu.Lock()
+	if j.pubRotateOn {
+		j.pubRotateMu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	j.pubRotateStop = stop
+	j.pubRotateOn = true
+	j.pubRotateMu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(telemostPublisherRotationPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				j.rotatePublisher()
+			}
+		}
+	}()
+}
+
+func (j *TelemostHeadlessJoiner) stopPublisherRotation() {
+	j.pubRotateMu.Lock()
+	if j.pubRotateOn {
+		close(j.pubRotateStop)
+		j.pubRotateStop = nil
+		j.pubRotateOn = false
+	}
+	j.pubRotateMu.Unlock()
+}
+
 func (j *TelemostHeadlessJoiner) handlePubAnswer(sdp string) {
+	j.pubSignalMu.Lock()
+	defer j.pubSignalMu.Unlock()
 	if j.pubPC == nil {
 		return
 	}
@@ -754,11 +846,13 @@ func (j *TelemostHeadlessJoiner) handleMessage(raw []byte) {
 				j.subPending = append(j.subPending, cand)
 			}
 		} else if target == "PUBLISHER" {
+			j.pubSignalMu.Lock()
 			if j.pubRemoteSet {
 				j.pubPC.AddICECandidate(cand)
 			} else {
 				j.pubPending = append(j.pubPending, cand)
 			}
+			j.pubSignalMu.Unlock()
 		}
 		j.ack(uid)
 		return
@@ -1037,6 +1131,7 @@ func (j *TelemostHeadlessJoiner) connectAndRun() {
 
 	close(stopPing)
 	close(stopStateKeepalive)
+	j.stopPublisherRotation()
 	if j.vp8tunnel != nil {
 		j.vp8tunnel.Stop()
 	}
