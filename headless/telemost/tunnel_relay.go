@@ -35,6 +35,26 @@ type SFURelay struct {
 
 func (r *SFURelay) SetObfuscator(o *tunnel.TunnelObfuscator) { r.obf = o }
 
+func (r *SFURelay) PausePublisher() bool {
+	r.mu.Lock()
+	tun := r.tun
+	r.mu.Unlock()
+	if tun == nil {
+		return false
+	}
+	tun.PauseTrack()
+	return true
+}
+
+func (r *SFURelay) ResumePublisher() {
+	r.mu.Lock()
+	tun := r.tun
+	r.mu.Unlock()
+	if tun != nil {
+		tun.ResumeTrack()
+	}
+}
+
 func NewSFURelay() *SFURelay {
 	return &SFURelay{}
 }

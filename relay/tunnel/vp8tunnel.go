@@ -28,6 +28,7 @@ type VP8DataTunnel struct {
 
 	stopOnce sync.Once
 	running  atomic.Bool
+	paused   atomic.Bool
 
 	cfgMu sync.Mutex
 	fps   int
@@ -47,7 +48,20 @@ func (t *VP8DataTunnel) SetTrack(track *webrtc.TrackLocalStaticSample) {
 	t.trackMu.Lock()
 	t.track = track
 	t.trackMu.Unlock()
+	t.paused.Store(false)
 	t.logFn("vp8tunnel: publisher track rotated")
+}
+
+func (t *VP8DataTunnel) PauseTrack() {
+	if t.paused.CompareAndSwap(false, true) {
+		t.logFn("vp8tunnel: publisher track paused")
+	}
+}
+
+func (t *VP8DataTunnel) ResumeTrack() {
+	if t.paused.CompareAndSwap(true, false) {
+		t.logFn("vp8tunnel: publisher track resumed")
+	}
 }
 
 func (t *VP8DataTunnel) SetOnData(fn func([]byte)) { t.OnData = fn }
@@ -181,6 +195,9 @@ func (t *VP8DataTunnel) writerLoop() {
 			case <-t.cfgChan:
 				reconfigure = true
 			case <-ticker.C:
+				if t.paused.Load() {
+					continue
+				}
 				var sample []byte
 				now := time.Now()
 				forceKeyframe := lastKeyframe.IsZero() || now.Sub(lastKeyframe) >= keyframePeriod

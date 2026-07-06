@@ -60,12 +60,12 @@ jobs:
 
       - name: Build Android APK
         run: |
-          sed -i 's/val versionPatch = 6/val versionPatch = 13/' android-app/app/build.gradle.kts
+          sed -i 's/val versionPatch = 6/val versionPatch = 14/' android-app/app/build.gradle.kts
           cd android-app
           chmod +x gradlew
           ./gradlew assembleRelease
           cp app/build/outputs/apk/release/app-release.apk \
-            ../artifacts/whitelist-bypass-0.3.13-slotfix8.apk
+            ../artifacts/whitelist-bypass-0.3.14-slotfix9.apk
 
       - uses: actions/upload-artifact@v4
         with:

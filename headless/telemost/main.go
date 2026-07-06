@@ -252,8 +252,15 @@ func (b *Bridge) rotatePublisher(relay *SFURelay) {
 	}
 
 	seq := int(b.pubSeq.Add(1))
+	paused := relay.PausePublisher()
+	if paused {
+		time.Sleep(200 * time.Millisecond)
+	}
 	offer, err := relay.CreateRotatedPublisher(b.connInfo.ICEServers, seq)
 	if err != nil {
+		if paused {
+			relay.ResumePublisher()
+		}
 		log.Printf("[pub-rotate] offer failed: %v", err)
 		return
 	}
@@ -452,6 +459,7 @@ func (b *Bridge) handleMessage(raw []byte) {
 		sdp, _ := paMap["sdp"].(string)
 		log.Printf("[tm-ws] <- publisherSdpAnswer %d bytes", len(sdp))
 		if err := b.relay.SetPubAnswer(sdp); err != nil {
+			b.relay.ResumePublisher()
 			log.Printf("[tm-ws]    error: %v", err)
 			return
 		}

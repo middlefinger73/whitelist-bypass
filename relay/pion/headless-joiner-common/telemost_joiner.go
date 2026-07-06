@@ -560,9 +560,17 @@ func (j *TelemostHeadlessJoiner) rotatePublisher() {
 	}
 
 	seq := int(j.pubSeq.Add(1))
+	paused := j.vp8tunnel != nil
+	if paused {
+		j.vp8tunnel.PauseTrack()
+		time.Sleep(200 * time.Millisecond)
+	}
 	oldPubPC := j.pubPC
 	pubPC, err := j.pcAPI.NewPeerConnection(j.pcConfig)
 	if err != nil {
+		if paused {
+			j.vp8tunnel.ResumeTrack()
+		}
 		j.logFn("telemost-joiner: [pub-rotate] create PC: %v", err)
 		return
 	}
@@ -594,11 +602,17 @@ func (j *TelemostHeadlessJoiner) rotatePublisher() {
 	offer, err := pubPC.CreateOffer(nil)
 	if err != nil {
 		pubPC.Close()
+		if paused {
+			j.vp8tunnel.ResumeTrack()
+		}
 		j.logFn("telemost-joiner: [pub-rotate] offer failed: %v", err)
 		return
 	}
 	if err := pubPC.SetLocalDescription(offer); err != nil {
 		pubPC.Close()
+		if paused {
+			j.vp8tunnel.ResumeTrack()
+		}
 		j.logFn("telemost-joiner: [pub-rotate] set local description: %v", err)
 		return
 	}
@@ -673,6 +687,9 @@ func (j *TelemostHeadlessJoiner) handlePubAnswer(sdp string) {
 		SDP:  sdp,
 	})
 	if err != nil {
+		if j.vp8tunnel != nil {
+			j.vp8tunnel.ResumeTrack()
+		}
 		j.logFn("telemost-joiner: set pub remote desc: %v", err)
 		return
 	}
