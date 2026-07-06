@@ -29,7 +29,10 @@ func TestReliableDeliveryReordersAndDeduplicates(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("delivery order = %v, want %v", got, want)
 	}
-	if ack := tun.ackSeq.Load(); ack != 2 {
+	tun.ackMu.Lock()
+	ack := tun.ackSeq
+	tun.ackMu.Unlock()
+	if ack != 2 {
 		t.Fatalf("cumulative ack = %d, want 2", ack)
 	}
 }
@@ -40,10 +43,25 @@ func TestReliableAckRemovesPendingPackets(t *testing.T) {
 	tun.pending[2] = &reliablePendingPacket{data: []byte("two")}
 	tun.pending[3] = &reliablePendingPacket{data: []byte("three")}
 
-	tun.HandlePayload(encodeReliablePacket(reliableKindAck, 2, nil))
+	tun.HandlePayload(encodeReliablePacket(reliableKindAck, 2, make([]byte, reliableAckMapBytes)))
 
 	if len(tun.pending) != 1 || tun.pending[3] == nil {
 		t.Fatalf("pending after ack = %#v, want only seq 3", tun.pending)
+	}
+}
+
+func TestReliableSelectiveAckRemovesPacketsAfterGap(t *testing.T) {
+	tun := newReliableTestTunnel(t)
+	for seq := uint32(1); seq <= 4; seq++ {
+		tun.pending[seq] = &reliablePendingPacket{data: []byte{byte(seq)}}
+	}
+	bitmap := make([]byte, reliableAckMapBytes)
+	bitmap[0] = 0b00001110 // Sequences 2, 3, and 4 after cumulative ACK 0.
+
+	tun.HandlePayload(encodeReliablePacket(reliableKindAck, 0, bitmap))
+
+	if len(tun.pending) != 1 || tun.pending[1] == nil {
+		t.Fatalf("pending after selective ack = %#v, want only seq 1", tun.pending)
 	}
 }
 

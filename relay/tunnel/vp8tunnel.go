@@ -19,6 +19,7 @@ const (
 	reliableRetryPeriod = 250 * time.Millisecond
 	reliableAckPeriod   = 20 * time.Millisecond
 	reliableWindowSize  = 1024
+	reliableAckMapBytes = reliableWindowSize / 8
 	reliableHeaderLen   = 9
 	reliableMagic       = 0x57425231 // WBR1
 	reliableKindData    = 1
@@ -59,8 +60,10 @@ type VP8DataTunnel struct {
 	recvMu         sync.Mutex
 	nextRecvSeq    uint32
 	recvPending    map[uint32][]byte
-	ackSeq         atomic.Uint32
-	ackDirty       atomic.Bool
+	ackMu          sync.Mutex
+	ackSeq         uint32
+	ackBitmap      [reliableAckMapBytes]byte
+	ackDirty       bool
 	lastAckSent    time.Time
 
 	OnData  func([]byte)
@@ -338,7 +341,7 @@ func (t *VP8DataTunnel) HandlePayload(payload []byte) {
 	}
 	switch kind {
 	case reliableKindAck:
-		t.handleReliableAck(seq)
+		t.handleReliableAck(seq, body)
 	case reliableKindData:
 		t.handleReliableData(seq, body)
 	}
@@ -353,10 +356,16 @@ func (t *VP8DataTunnel) nextOutboundData(now time.Time) []byte {
 			return nil
 		}
 	}
-	if t.ackDirty.Load() && (t.lastAckSent.IsZero() || now.Sub(t.lastAckSent) >= reliableAckPeriod) && t.ackDirty.Swap(false) {
+	t.ackMu.Lock()
+	if t.ackDirty && (t.lastAckSent.IsZero() || now.Sub(t.lastAckSent) >= reliableAckPeriod) {
+		bitmap := append([]byte(nil), t.ackBitmap[:]...)
+		packet := encodeReliablePacket(reliableKindAck, t.ackSeq, bitmap)
+		t.ackDirty = false
 		t.lastAckSent = now
-		return encodeReliablePacket(reliableKindAck, t.ackSeq.Load(), nil)
+		t.ackMu.Unlock()
+		return packet
 	}
+	t.ackMu.Unlock()
 
 	t.pendingMu.Lock()
 	var retrySeq uint32
@@ -401,10 +410,17 @@ func (t *VP8DataTunnel) nextOutboundData(now time.Time) []byte {
 	}
 }
 
-func (t *VP8DataTunnel) handleReliableAck(ack uint32) {
+func (t *VP8DataTunnel) handleReliableAck(ack uint32, bitmap []byte) {
 	t.pendingMu.Lock()
 	for seq := range t.pending {
 		if seq <= ack {
+			delete(t.pending, seq)
+			continue
+		}
+		offset := seq - ack - 1
+		byteIndex := int(offset / 8)
+		bitIndex := uint(offset % 8)
+		if byteIndex < len(bitmap) && bitmap[byteIndex]&(1<<bitIndex) != 0 {
 			delete(t.pending, seq)
 		}
 	}
@@ -414,9 +430,9 @@ func (t *VP8DataTunnel) handleReliableAck(ack uint32) {
 func (t *VP8DataTunnel) handleReliableData(seq uint32, payload []byte) {
 	t.recvMu.Lock()
 	if seq < t.nextRecvSeq {
-		ack := t.nextRecvSeq - 1
+		ack, bitmap := t.reliableAckStateLocked()
 		t.recvMu.Unlock()
-		t.queueReliableAck(ack)
+		t.queueReliableAck(ack, bitmap)
 		return
 	}
 	if seq > t.nextRecvSeq {
@@ -425,9 +441,9 @@ func (t *VP8DataTunnel) handleReliableData(seq uint32, payload []byte) {
 				t.recvPending[seq] = append([]byte(nil), payload...)
 			}
 		}
-		ack := t.nextRecvSeq - 1
+		ack, bitmap := t.reliableAckStateLocked()
 		t.recvMu.Unlock()
-		t.queueReliableAck(ack)
+		t.queueReliableAck(ack, bitmap)
 		return
 	}
 
@@ -442,9 +458,9 @@ func (t *VP8DataTunnel) handleReliableData(seq uint32, payload []byte) {
 		deliver = append(deliver, buffered)
 		t.nextRecvSeq++
 	}
-	ack := t.nextRecvSeq - 1
+	ack, bitmap := t.reliableAckStateLocked()
 	t.recvMu.Unlock()
-	t.queueReliableAck(ack)
+	t.queueReliableAck(ack, bitmap)
 	for _, data := range deliver {
 		if t.OnData != nil {
 			t.OnData(data)
@@ -452,9 +468,26 @@ func (t *VP8DataTunnel) handleReliableData(seq uint32, payload []byte) {
 	}
 }
 
-func (t *VP8DataTunnel) queueReliableAck(seq uint32) {
-	t.ackSeq.Store(seq)
-	t.ackDirty.Store(true)
+func (t *VP8DataTunnel) reliableAckStateLocked() (uint32, []byte) {
+	ack := t.nextRecvSeq - 1
+	bitmap := make([]byte, reliableAckMapBytes)
+	for seq := range t.recvPending {
+		offset := seq - ack - 1
+		if offset >= reliableWindowSize {
+			continue
+		}
+		bitmap[offset/8] |= 1 << (offset % 8)
+	}
+	return ack, bitmap
+}
+
+func (t *VP8DataTunnel) queueReliableAck(seq uint32, bitmap []byte) {
+	t.ackMu.Lock()
+	t.ackSeq = seq
+	clear(t.ackBitmap[:])
+	copy(t.ackBitmap[:], bitmap)
+	t.ackDirty = true
+	t.ackMu.Unlock()
 }
 
 // ResetReliablePeer drops receive reordering state after a real process restart.
