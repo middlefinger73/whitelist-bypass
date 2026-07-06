@@ -504,6 +504,7 @@ func (j *TelemostHeadlessJoiner) initPC() {
 			j.logFn("telemost-joiner: === VP8 TUNNEL CONNECTED ===")
 			j.Status.EmitStatus(common.StatusTunnelConnected)
 			j.vp8tunnel = tunnel.NewVP8DataTunnel(j.sampleTrack, j.obf, j.logFn)
+			j.vp8tunnel.EnableReliableDelivery()
 			j.vp8tunnel.Start(j.vp8FPS, j.vp8Batch)
 			j.vp8tunnel.SendData(tunnel.EncodeVP8Config(j.vp8tunnel.FPS(), j.vp8tunnel.Batch(), 1))
 			j.logFn("telemost-joiner: pushed vp8 config to creator fps=%d batch=%d", j.vp8tunnel.FPS(), j.vp8tunnel.Batch())

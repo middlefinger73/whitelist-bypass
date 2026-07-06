@@ -94,6 +94,7 @@ func (r *SFURelay) Init(iceServers []webrtc.ICEServer) error {
 			if r.tun == nil {
 				log.Println("[relay] starting VP8 publish tunnel on pub PC connected")
 				r.tun = tunnel.NewVP8DataTunnel(r.sampleTrack, r.obf, log.Printf)
+				r.tun.EnableReliableDelivery()
 				r.tun.Start(0, 0)
 				if r.OnConnected != nil {
 					r.OnConnected(r.tun)
@@ -374,6 +375,9 @@ func (r *SFURelay) readTrack(track *webrtc.TrackRemote) {
 		}
 		if res.PeerRestart {
 			log.Printf("[video] peer restart detected, new epoch=0x%08x", res.PeerEpoch)
+			if r.tun != nil {
+				r.tun.ResetReliablePeer()
+			}
 			if r.OnPeerRestart != nil {
 				r.OnPeerRestart()
 			}
@@ -381,8 +385,8 @@ func (r *SFURelay) readTrack(track *webrtc.TrackRemote) {
 		if res.Keepalive || len(res.Payload) == 0 {
 			continue
 		}
-		if r.tun != nil && r.tun.OnData != nil {
-			r.tun.OnData(res.Payload)
+		if r.tun != nil {
+			r.tun.HandlePayload(res.Payload)
 		}
 	}
 }

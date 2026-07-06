@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"encoding/binary"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,7 +16,20 @@ const (
 	keepaliveIdlePeriod = 100 * time.Millisecond
 	keyframePeriod      = 2 * time.Second
 	sendQueueDepth      = 128
+	reliableRetryPeriod = 250 * time.Millisecond
+	reliableAckPeriod   = 20 * time.Millisecond
+	reliableWindowSize  = 1024
+	reliableHeaderLen   = 9
+	reliableMagic       = 0x57425231 // WBR1
+	reliableKindData    = 1
+	reliableKindAck     = 2
 )
+
+type reliablePendingPacket struct {
+	data     []byte
+	lastSent time.Time
+	attempts int
+}
 
 type VP8DataTunnel struct {
 	track     *webrtc.TrackLocalStaticSample
@@ -29,6 +43,7 @@ type VP8DataTunnel struct {
 	stopOnce sync.Once
 	running  atomic.Bool
 	paused   atomic.Bool
+	reliable atomic.Bool
 
 	cfgMu sync.Mutex
 	fps   int
@@ -36,6 +51,17 @@ type VP8DataTunnel struct {
 
 	sentFrames atomic.Uint64
 	recvFrames atomic.Uint64
+
+	reliableSendMu sync.Mutex
+	nextSendSeq    uint32
+	pendingMu      sync.Mutex
+	pending        map[uint32]*reliablePendingPacket
+	recvMu         sync.Mutex
+	nextRecvSeq    uint32
+	recvPending    map[uint32][]byte
+	ackSeq         atomic.Uint32
+	ackDirty       atomic.Bool
+	lastAckSent    time.Time
 
 	OnData  func([]byte)
 	OnClose func()
@@ -66,6 +92,25 @@ func (t *VP8DataTunnel) ResumeTrack() {
 
 func (t *VP8DataTunnel) SetOnData(fn func([]byte)) { t.OnData = fn }
 func (t *VP8DataTunnel) SetOnClose(fn func())       { t.OnClose = fn }
+
+// EnableReliableDelivery adds ordered delivery, cumulative acknowledgements,
+// and retransmission to the lossy VP8 media transport. Both peers must enable it.
+func (t *VP8DataTunnel) EnableReliableDelivery() {
+	t.reliableSendMu.Lock()
+	t.pendingMu.Lock()
+	t.recvMu.Lock()
+	if !t.reliable.Load() {
+		t.nextSendSeq = 1
+		t.nextRecvSeq = 1
+		t.pending = make(map[uint32]*reliablePendingPacket)
+		t.recvPending = make(map[uint32][]byte)
+		t.reliable.Store(true)
+		t.logFn("vp8tunnel: reliable delivery enabled")
+	}
+	t.recvMu.Unlock()
+	t.pendingMu.Unlock()
+	t.reliableSendMu.Unlock()
+}
 
 func NewVP8DataTunnel(track *webrtc.TrackLocalStaticSample, obf *TunnelObfuscator, logFn func(string, ...any)) *VP8DataTunnel {
 	return &VP8DataTunnel{
@@ -120,6 +165,18 @@ func (t *VP8DataTunnel) Batch() int {
 
 func (t *VP8DataTunnel) SendData(data []byte) {
 	if len(data) == 0 {
+		return
+	}
+	if t.reliable.Load() {
+		t.reliableSendMu.Lock()
+		seq := t.nextSendSeq
+		t.nextSendSeq++
+		data = encodeReliablePacket(reliableKindData, seq, data)
+		select {
+		case t.sendQueue <- data:
+		case <-t.stopCh:
+		}
+		t.reliableSendMu.Unlock()
 		return
 	}
 	select {
@@ -207,11 +264,11 @@ func (t *VP8DataTunnel) writerLoop() {
 					lastKeyframe = now
 					forcedKeyframes++
 				} else {
-					select {
-					case data := <-t.sendQueue:
+					data := t.nextOutboundData(now)
+					if data != nil {
 						sample = t.obf.EncodeData(data)
 						idleTicks = 0
-					default:
+					} else {
 						idleTicks++
 						if idleTicks < keepaliveEvery {
 							continue
@@ -253,6 +310,7 @@ func (t *VP8DataTunnel) HandleFrame(frame []byte) {
 	}
 	if res.PeerRestart {
 		t.logFn("vp8tunnel: peer restart detected, new epoch=0x%08x", res.PeerEpoch)
+		t.ResetReliablePeer()
 	}
 	if res.Keepalive || len(res.Payload) == 0 {
 		return
@@ -261,7 +319,176 @@ func (t *VP8DataTunnel) HandleFrame(frame []byte) {
 	if n <= 5 || n%500 == 0 {
 		t.logFn("vp8tunnel: recv frame #%d size=%d", n, len(res.Payload))
 	}
-	if t.OnData != nil {
-		t.OnData(res.Payload)
+	t.HandlePayload(res.Payload)
+}
+
+// HandlePayload accepts an already decrypted VP8 payload. The creator uses it
+// because its SFU track reader performs VP8 frame assembly and decryption.
+func (t *VP8DataTunnel) HandlePayload(payload []byte) {
+	if !t.reliable.Load() {
+		if t.OnData != nil {
+			t.OnData(payload)
+		}
+		return
 	}
+	kind, seq, body, ok := decodeReliablePacket(payload)
+	if !ok {
+		t.logFn("vp8tunnel: dropped non-reliable payload while reliable delivery is enabled")
+		return
+	}
+	switch kind {
+	case reliableKindAck:
+		t.handleReliableAck(seq)
+	case reliableKindData:
+		t.handleReliableData(seq, body)
+	}
+}
+
+func (t *VP8DataTunnel) nextOutboundData(now time.Time) []byte {
+	if !t.reliable.Load() {
+		select {
+		case data := <-t.sendQueue:
+			return data
+		default:
+			return nil
+		}
+	}
+	if t.ackDirty.Load() && (t.lastAckSent.IsZero() || now.Sub(t.lastAckSent) >= reliableAckPeriod) && t.ackDirty.Swap(false) {
+		t.lastAckSent = now
+		return encodeReliablePacket(reliableKindAck, t.ackSeq.Load(), nil)
+	}
+
+	t.pendingMu.Lock()
+	var retrySeq uint32
+	var retry *reliablePendingPacket
+	for seq, packet := range t.pending {
+		if now.Sub(packet.lastSent) < reliableRetryPeriod {
+			continue
+		}
+		if retry == nil || packet.lastSent.Before(retry.lastSent) {
+			retrySeq, retry = seq, packet
+		}
+	}
+	if retry != nil {
+		retry.lastSent = now
+		retry.attempts++
+		data := retry.data
+		attempts := retry.attempts
+		t.pendingMu.Unlock()
+		if attempts == 2 || attempts%20 == 0 {
+			t.logFn("vp8tunnel: retransmit seq=%d attempt=%d", retrySeq, attempts)
+		}
+		return data
+	}
+	if len(t.pending) >= reliableWindowSize {
+		t.pendingMu.Unlock()
+		return nil
+	}
+	t.pendingMu.Unlock()
+
+	select {
+	case data := <-t.sendQueue:
+		_, seq, _, ok := decodeReliablePacket(data)
+		if !ok {
+			return nil
+		}
+		t.pendingMu.Lock()
+		t.pending[seq] = &reliablePendingPacket{data: data, lastSent: now, attempts: 1}
+		t.pendingMu.Unlock()
+		return data
+	default:
+		return nil
+	}
+}
+
+func (t *VP8DataTunnel) handleReliableAck(ack uint32) {
+	t.pendingMu.Lock()
+	for seq := range t.pending {
+		if seq <= ack {
+			delete(t.pending, seq)
+		}
+	}
+	t.pendingMu.Unlock()
+}
+
+func (t *VP8DataTunnel) handleReliableData(seq uint32, payload []byte) {
+	t.recvMu.Lock()
+	if seq < t.nextRecvSeq {
+		ack := t.nextRecvSeq - 1
+		t.recvMu.Unlock()
+		t.queueReliableAck(ack)
+		return
+	}
+	if seq > t.nextRecvSeq {
+		if seq-t.nextRecvSeq <= reliableWindowSize {
+			if _, exists := t.recvPending[seq]; !exists {
+				t.recvPending[seq] = append([]byte(nil), payload...)
+			}
+		}
+		ack := t.nextRecvSeq - 1
+		t.recvMu.Unlock()
+		t.queueReliableAck(ack)
+		return
+	}
+
+	deliver := [][]byte{append([]byte(nil), payload...)}
+	t.nextRecvSeq++
+	for {
+		buffered, ok := t.recvPending[t.nextRecvSeq]
+		if !ok {
+			break
+		}
+		delete(t.recvPending, t.nextRecvSeq)
+		deliver = append(deliver, buffered)
+		t.nextRecvSeq++
+	}
+	ack := t.nextRecvSeq - 1
+	t.recvMu.Unlock()
+	t.queueReliableAck(ack)
+	for _, data := range deliver {
+		if t.OnData != nil {
+			t.OnData(data)
+		}
+	}
+}
+
+func (t *VP8DataTunnel) queueReliableAck(seq uint32) {
+	t.ackSeq.Store(seq)
+	t.ackDirty.Store(true)
+}
+
+// ResetReliablePeer drops receive reordering state after a real process restart.
+// Publisher PC rotation keeps the same obfuscator epoch and does not call this.
+func (t *VP8DataTunnel) ResetReliablePeer() {
+	if !t.reliable.Load() {
+		return
+	}
+	t.recvMu.Lock()
+	t.nextRecvSeq = 1
+	clear(t.recvPending)
+	t.recvMu.Unlock()
+}
+
+func encodeReliablePacket(kind byte, seq uint32, payload []byte) []byte {
+	packet := make([]byte, reliableHeaderLen+len(payload))
+	binary.BigEndian.PutUint32(packet[0:4], reliableMagic)
+	packet[4] = kind
+	binary.BigEndian.PutUint32(packet[5:9], seq)
+	copy(packet[reliableHeaderLen:], payload)
+	return packet
+}
+
+func decodeReliablePacket(packet []byte) (kind byte, seq uint32, payload []byte, ok bool) {
+	if len(packet) < reliableHeaderLen || binary.BigEndian.Uint32(packet[0:4]) != reliableMagic {
+		return 0, 0, nil, false
+	}
+	kind = packet[4]
+	if kind != reliableKindData && kind != reliableKindAck {
+		return 0, 0, nil, false
+	}
+	seq = binary.BigEndian.Uint32(packet[5:9])
+	if kind == reliableKindData && seq == 0 {
+		return 0, 0, nil, false
+	}
+	return kind, seq, packet[reliableHeaderLen:], true
 }
