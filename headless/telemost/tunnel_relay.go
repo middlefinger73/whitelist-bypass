@@ -55,6 +55,15 @@ func (r *SFURelay) ResumePublisher() {
 	}
 }
 
+func (r *SFURelay) SetTunnelPeerConnected(connected bool) {
+	r.mu.Lock()
+	tun := r.tun
+	r.mu.Unlock()
+	if tun != nil {
+		tun.SetPeerConnected(connected)
+	}
+}
+
 func NewSFURelay() *SFURelay {
 	return &SFURelay{}
 }

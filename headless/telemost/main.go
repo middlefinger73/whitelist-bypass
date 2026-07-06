@@ -558,6 +558,7 @@ func (b *Bridge) handleMessage(raw []byte) {
 			}
 			b.mu.Unlock()
 			log.Printf("[tm-ws] Participant left: %s (%s) total=%d", name, pid, remaining)
+			b.setRemotePeerCount(remaining)
 			if hadPendingKick {
 				close(ch)
 			}
@@ -738,6 +739,17 @@ func (b *Bridge) applyDescriptionEntry(dm map[string]interface{}) {
 	case !wasKnown:
 		log.Printf("[tm-ws] Participant joined: %s (%s) total=%d", name, pid, total)
 	}
+	b.setRemotePeerCount(total)
+}
+
+func (b *Bridge) setRemotePeerCount(total int) {
+	connected := total > 0
+	if b.relay != nil {
+		b.relay.SetTunnelPeerConnected(connected)
+	}
+	if !connected && b.activeBridge != nil {
+		b.activeBridge.Reset()
+	}
 }
 
 func (b *Bridge) applyDescriptionSnapshot(descs []interface{}) {
@@ -748,6 +760,10 @@ func (b *Bridge) applyDescriptionSnapshot(descs []interface{}) {
 		dm, _ := d.(map[string]interface{})
 		b.applyDescriptionEntry(dm)
 	}
+	b.mu.Lock()
+	total := len(b.peers)
+	b.mu.Unlock()
+	b.setRemotePeerCount(total)
 	b.kickStaleSelves()
 }
 

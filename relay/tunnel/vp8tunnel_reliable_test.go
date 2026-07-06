@@ -136,3 +136,23 @@ func TestReliablePeerResetStartsSequenceFromOne(t *testing.T) {
 		t.Fatalf("reset retained state: pending=%d recvPending=%d nextRecv=%d", len(tun.pending), len(tun.recvPending), tun.nextRecvSeq)
 	}
 }
+
+func TestReliableDisconnectClearsAndStopsTraffic(t *testing.T) {
+	tun := newReliableTestTunnel(t)
+	tun.SendData([]byte("queued"))
+	tun.pending[2] = &reliablePendingPacket{data: []byte("pending")}
+
+	tun.SetPeerConnected(false)
+	tun.SendData([]byte("dropped"))
+
+	if len(tun.sendQueue) != 0 || len(tun.pending) != 0 {
+		t.Fatalf("disconnect retained traffic: queued=%d pending=%d", len(tun.sendQueue), len(tun.pending))
+	}
+	tun.SetPeerConnected(true)
+	tun.SendData([]byte("fresh"))
+	packet := <-tun.sendQueue
+	_, seq, body, ok := decodeReliablePacket(packet)
+	if !ok || seq != 1 || string(body) != "fresh" {
+		t.Fatalf("first packet after reconnect: ok=%v seq=%d body=%q", ok, seq, body)
+	}
+}

@@ -16,7 +16,7 @@ const (
 	keepaliveIdlePeriod = 100 * time.Millisecond
 	keyframePeriod      = 2 * time.Second
 	sendQueueDepth      = 128
-	reliableRetryPeriod = 250 * time.Millisecond
+	reliableRetryPeriod = time.Second
 	reliableAckPeriod   = 20 * time.Millisecond
 	reliableWindowSize  = 1024
 	reliableAckMapBytes = reliableWindowSize / 8
@@ -45,6 +45,7 @@ type VP8DataTunnel struct {
 	running  atomic.Bool
 	paused   atomic.Bool
 	reliable atomic.Bool
+	peerUp   atomic.Bool
 
 	cfgMu sync.Mutex
 	fps   int
@@ -54,6 +55,7 @@ type VP8DataTunnel struct {
 	recvFrames atomic.Uint64
 
 	reliableSendMu sync.Mutex
+	peerStateMu    sync.Mutex
 	outboundMu     sync.Mutex
 	nextSendSeq    uint32
 	pendingMu      sync.Mutex
@@ -108,6 +110,7 @@ func (t *VP8DataTunnel) EnableReliableDelivery() {
 		t.nextRecvSeq = 1
 		t.pending = make(map[uint32]*reliablePendingPacket)
 		t.recvPending = make(map[uint32][]byte)
+		t.peerUp.Store(true)
 		t.reliable.Store(true)
 		t.logFn("vp8tunnel: reliable delivery enabled")
 	}
@@ -173,6 +176,10 @@ func (t *VP8DataTunnel) SendData(data []byte) {
 	}
 	if t.reliable.Load() {
 		t.reliableSendMu.Lock()
+		if !t.peerUp.Load() {
+			t.reliableSendMu.Unlock()
+			return
+		}
 		seq := t.nextSendSeq
 		t.nextSendSeq++
 		data = encodeReliablePacket(reliableKindData, seq, data)
@@ -360,6 +367,9 @@ func (t *VP8DataTunnel) nextOutboundData(now time.Time) []byte {
 			return nil
 		}
 	}
+	if !t.peerUp.Load() {
+		return nil
+	}
 	t.ackMu.Lock()
 	if t.ackDirty && (t.lastAckSent.IsZero() || now.Sub(t.lastAckSent) >= reliableAckPeriod) {
 		bitmap := append([]byte(nil), t.ackBitmap[:]...)
@@ -501,6 +511,12 @@ func (t *VP8DataTunnel) ResetReliablePeer() {
 		return
 	}
 	t.reliableSendMu.Lock()
+	t.resetReliablePeerLocked()
+	t.reliableSendMu.Unlock()
+	t.logFn("vp8tunnel: reliable peer state reset")
+}
+
+func (t *VP8DataTunnel) resetReliablePeerLocked() {
 	t.outboundMu.Lock()
 	t.pendingMu.Lock()
 	t.nextSendSeq = 1
@@ -511,7 +527,6 @@ func (t *VP8DataTunnel) ResetReliablePeer() {
 		default:
 			t.pendingMu.Unlock()
 			t.outboundMu.Unlock()
-			t.reliableSendMu.Unlock()
 			goto sendReset
 		}
 	}
@@ -527,7 +542,31 @@ sendReset:
 	t.nextRecvSeq = 1
 	clear(t.recvPending)
 	t.recvMu.Unlock()
-	t.logFn("vp8tunnel: reliable peer state reset")
+}
+
+// SetPeerConnected stops retransmission while no remote tunnel peer is in the
+// conference. Reconnecting starts a clean sequence space.
+func (t *VP8DataTunnel) SetPeerConnected(connected bool) {
+	if !t.reliable.Load() {
+		return
+	}
+	t.peerStateMu.Lock()
+	defer t.peerStateMu.Unlock()
+	if t.peerUp.Load() == connected {
+		return
+	}
+	t.reliableSendMu.Lock()
+	if !connected {
+		t.peerUp.Store(false)
+		t.resetReliablePeerLocked()
+		t.reliableSendMu.Unlock()
+		t.logFn("vp8tunnel: peer disconnected, reliable traffic stopped")
+		return
+	}
+	t.resetReliablePeerLocked()
+	t.peerUp.Store(true)
+	t.reliableSendMu.Unlock()
+	t.logFn("vp8tunnel: peer connected, reliable traffic resumed")
 }
 
 func encodeReliablePacket(kind byte, seq uint32, payload []byte) []byte {
