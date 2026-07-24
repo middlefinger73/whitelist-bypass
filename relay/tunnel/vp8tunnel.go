@@ -40,6 +40,7 @@ type VP8DataTunnel struct {
 	stopCh    chan struct{}
 	sendQueue chan []byte
 	cfgChan   chan struct{}
+	wakeCh    chan struct{}
 
 	stopOnce sync.Once
 	running  atomic.Bool
@@ -127,6 +128,7 @@ func NewVP8DataTunnel(track *webrtc.TrackLocalStaticSample, obf *TunnelObfuscato
 		stopCh:    make(chan struct{}),
 		sendQueue: make(chan []byte, sendQueueDepth),
 		cfgChan:   make(chan struct{}, 1),
+		wakeCh:    make(chan struct{}, 1),
 		fps:       defaultVP8FPS,
 		batch:     defaultVP8Batch,
 	}
@@ -185,6 +187,7 @@ func (t *VP8DataTunnel) SendData(data []byte) {
 		data = encodeReliablePacket(reliableKindData, seq, data)
 		select {
 		case t.sendQueue <- data:
+			t.wakeWriter()
 		case <-t.stopCh:
 		}
 		t.reliableSendMu.Unlock()
@@ -192,7 +195,15 @@ func (t *VP8DataTunnel) SendData(data []byte) {
 	}
 	select {
 	case t.sendQueue <- data:
+		t.wakeWriter()
 	case <-t.stopCh:
+	}
+}
+
+func (t *VP8DataTunnel) wakeWriter() {
+	select {
+	case t.wakeCh <- struct{}{}:
+	default:
 	}
 }
 
@@ -249,46 +260,58 @@ func (t *VP8DataTunnel) writerLoop() {
 		t.logFn("vp8tunnel: writer (re)started fps=%d batch=%d sampleInterval=%s keepaliveEvery=%d",
 			fps, batch, sampleInterval, keepaliveEvery)
 
-		ticker := time.NewTicker(sampleInterval)
-		idleTicks := 0
 		lastKeyframe := time.Time{}
+		lastKeepalive := time.Time{}
 		forcedKeyframes := 0
 		reconfigure := false
+		nextDelay := time.Duration(0)
 
 		for !reconfigure {
+			if nextDelay < 0 {
+				nextDelay = 0
+			}
+			timer := time.NewTimer(nextDelay)
 			select {
 			case <-t.stopCh:
-				ticker.Stop()
+				stopTimer(timer)
 				return
 			case <-t.cfgChan:
+				stopTimer(timer)
 				reconfigure = true
-			case <-ticker.C:
+				continue
+			case <-t.wakeCh:
+				stopTimer(timer)
+			case <-timer.C:
+			}
 				if t.paused.Load() {
+					nextDelay = keepaliveIdlePeriod
 					continue
 				}
 				var sample []byte
 				now := time.Now()
 				forceKeyframe := lastKeyframe.IsZero() || now.Sub(lastKeyframe) >= keyframePeriod
 				if forceKeyframe {
-					idleTicks = 0
 					sample = vp8VideoKeyframe
 					lastKeyframe = now
+					lastKeepalive = now
 					forcedKeyframes++
 				} else {
 					data := t.nextOutboundData(now)
 					if data != nil {
 						sample = t.obf.EncodeData(data)
-						idleTicks = 0
+						nextDelay = sampleInterval
 					} else {
-						idleTicks++
-						if idleTicks < keepaliveEvery {
+						nextKeepalive := lastKeepalive.Add(keepaliveIdlePeriod)
+						if !lastKeepalive.IsZero() && now.Before(nextKeepalive) {
+							nextDelay = nextKeepalive.Sub(now)
 							continue
 						}
-						idleTicks = 0
 						sample = t.obf.EncodeKeepalive()
+						lastKeepalive = now
 					}
 				}
 				if sample == nil {
+					nextDelay = keepaliveIdlePeriod
 					continue
 				}
 				t.trackMu.RLock()
@@ -305,9 +328,20 @@ func (t *VP8DataTunnel) writerLoop() {
 				if n <= 5 || n%500 == 0 {
 					t.logFn("vp8tunnel: sent frame #%d size=%d", n, len(sample))
 				}
+				if !forceKeyframe && nextDelay == sampleInterval {
+					continue
+				}
+				nextDelay = keepaliveIdlePeriod
 			}
+	}
+}
+
+func stopTimer(timer *time.Timer) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
 		}
-		ticker.Stop()
 	}
 }
 
@@ -502,6 +536,7 @@ func (t *VP8DataTunnel) queueReliableAck(seq uint32, bitmap []byte) {
 	copy(t.ackBitmap[:], bitmap)
 	t.ackDirty = true
 	t.ackMu.Unlock()
+	t.wakeWriter()
 }
 
 // ResetReliablePeer starts a fresh reliable session after a real process restart.
@@ -566,6 +601,7 @@ func (t *VP8DataTunnel) SetPeerConnected(connected bool) {
 	t.resetReliablePeerLocked()
 	t.peerUp.Store(true)
 	t.reliableSendMu.Unlock()
+	t.wakeWriter()
 	t.logFn("vp8tunnel: peer connected, reliable traffic resumed")
 }
 
