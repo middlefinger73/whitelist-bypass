@@ -13,8 +13,8 @@ import (
 const (
 	defaultVP8FPS       = 24
 	defaultVP8Batch     = 30
-	keepaliveIdlePeriod = 100 * time.Millisecond
-	keyframePeriod      = 2 * time.Second
+	keepaliveIdlePeriod = time.Second
+	keyframePeriod      = 30 * time.Second
 	sendQueueDepth      = 128
 	reliableRetryPeriod = time.Second
 	reliableAckPeriod   = 20 * time.Millisecond
