@@ -413,6 +413,9 @@ func (t *VP8DataTunnel) HandlePayload(payload []byte) {
 func (t *VP8DataTunnel) nextOutboundData(now time.Time) []byte {
 	t.outboundMu.Lock()
 	defer t.outboundMu.Unlock()
+	if t.paused.Load() {
+		return nil
+	}
 
 	if !t.reliable.Load() {
 		select {

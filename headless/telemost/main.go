@@ -613,6 +613,9 @@ func (b *Bridge) handleMessage(raw []byte) {
 				b.slotMu.Unlock()
 				if recovered {
 					log.Printf("[bind] video slot recovered without reconnect")
+					if b.relay != nil {
+						b.relay.ResumePublisher()
+					}
 				}
 			} else if fullPid != "" {
 				b.slotMu.Lock()
@@ -648,7 +651,11 @@ func (b *Bridge) handleMessage(raw []byte) {
 		hasBound := len(b.boundPeers) > 0
 		b.slotMu.Unlock()
 		if lostBinding && !hasBound {
-			log.Printf("[bind] no video slot in current layout; keeping WebRTC session")
+			log.Printf("[bind] no video slot in current layout; pausing publisher and requesting recovery")
+			if b.relay != nil {
+				b.relay.PausePublisher()
+			}
+			b.startSlotRecovery()
 		}
 		b.ack(uid)
 		return
