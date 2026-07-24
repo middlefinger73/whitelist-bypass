@@ -2,6 +2,9 @@ name: Build Telemost slot recovery patch
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - codex/telemost-slot-grace
 
 jobs:
   build:
