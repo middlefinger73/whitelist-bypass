@@ -12,11 +12,11 @@ import (
 
 const (
 	defaultVP8FPS       = 24
-	defaultVP8Batch     = 30
+	defaultVP8Batch     = 10
 	keepaliveIdlePeriod = time.Second
 	keyframePeriod      = 30 * time.Second
 	sendQueueDepth      = 128
-	reliableRetryPeriod = time.Second
+	reliableRetryPeriod = 500 * time.Millisecond
 	reliableAckPeriod   = 20 * time.Millisecond
 	reliableWindowSize  = 1024
 	reliableAckMapBytes = reliableWindowSize / 8
@@ -283,57 +283,78 @@ func (t *VP8DataTunnel) writerLoop() {
 				stopTimer(timer)
 			case <-timer.C:
 			}
-				if t.paused.Load() {
-					nextDelay = keepaliveIdlePeriod
-					continue
-				}
-				var sample []byte
-				now := time.Now()
-				forceKeyframe := lastKeyframe.IsZero() || now.Sub(lastKeyframe) >= keyframePeriod
-				if forceKeyframe {
-					sample = vp8VideoKeyframe
-					lastKeyframe = now
-					lastKeepalive = now
-					forcedKeyframes++
-				} else {
-					data := t.nextOutboundData(now)
-					if data != nil {
-						sample = t.obf.EncodeData(data)
-						nextDelay = sampleInterval
-					} else {
-						nextKeepalive := lastKeepalive.Add(keepaliveIdlePeriod)
-						if !lastKeepalive.IsZero() && now.Before(nextKeepalive) {
-							nextDelay = nextKeepalive.Sub(now)
-							continue
-						}
-						sample = t.obf.EncodeKeepalive()
-						lastKeepalive = now
-					}
-				}
-				if sample == nil {
-					nextDelay = keepaliveIdlePeriod
-					continue
-				}
-				t.trackMu.RLock()
-				track := t.track
-				t.trackMu.RUnlock()
-				if err := track.WriteSample(media.Sample{Data: sample, Duration: sampleInterval}); err != nil {
-					t.logFn("vp8tunnel: WriteSample error: %v", err)
-					continue
-				}
-				n := t.sentFrames.Add(1)
-				if forceKeyframe && (forcedKeyframes <= 3 || forcedKeyframes%30 == 0) {
-					t.logFn("vp8tunnel: forced keyframe #%d at frame #%d", forcedKeyframes, n)
-				}
-				if n <= 5 || n%500 == 0 {
-					t.logFn("vp8tunnel: sent frame #%d size=%d", n, len(sample))
-				}
-				if !forceKeyframe && nextDelay == sampleInterval {
-					continue
-				}
+			if t.paused.Load() {
 				nextDelay = keepaliveIdlePeriod
+				continue
 			}
+			var sample []byte
+			now := time.Now()
+			forceKeyframe := lastKeyframe.IsZero() || now.Sub(lastKeyframe) >= keyframePeriod
+			if forceKeyframe {
+				sample = vp8VideoKeyframe
+				lastKeyframe = now
+				lastKeepalive = now
+				forcedKeyframes++
+			} else {
+				data := t.nextOutboundData(now)
+				if data != nil {
+					sample = t.obf.EncodeData(data)
+					nextDelay = sampleInterval
+				} else {
+					nextKeepalive := lastKeepalive.Add(keepaliveIdlePeriod)
+					if !lastKeepalive.IsZero() && now.Before(nextKeepalive) {
+						nextDelay = t.nextIdleDelay(now, nextKeepalive.Sub(now))
+						continue
+					}
+					sample = t.obf.EncodeKeepalive()
+					lastKeepalive = now
+				}
+			}
+			if sample == nil {
+				nextDelay = t.nextIdleDelay(now, keepaliveIdlePeriod)
+				continue
+			}
+			t.trackMu.RLock()
+			track := t.track
+			t.trackMu.RUnlock()
+			if err := track.WriteSample(media.Sample{Data: sample, Duration: sampleInterval}); err != nil {
+				t.logFn("vp8tunnel: WriteSample error: %v", err)
+				continue
+			}
+			n := t.sentFrames.Add(1)
+			if forceKeyframe && (forcedKeyframes <= 3 || forcedKeyframes%30 == 0) {
+				t.logFn("vp8tunnel: forced keyframe #%d at frame #%d", forcedKeyframes, n)
+			}
+			if n <= 5 || n%500 == 0 {
+				t.logFn("vp8tunnel: sent frame #%d size=%d", n, len(sample))
+			}
+			if !forceKeyframe && nextDelay == sampleInterval {
+				continue
+			}
+			nextDelay = t.nextIdleDelay(time.Now(), keepaliveIdlePeriod)
+		}
 	}
+}
+
+// nextIdleDelay lets pending reliable packets wake the writer before the
+// keepalive deadline. This keeps recovery latency below one second without
+// bringing back the old high-frequency idle ticker.
+func (t *VP8DataTunnel) nextIdleDelay(now time.Time, fallback time.Duration) time.Duration {
+	if !t.reliable.Load() || !t.peerUp.Load() {
+		return fallback
+	}
+	t.pendingMu.Lock()
+	defer t.pendingMu.Unlock()
+	for _, packet := range t.pending {
+		remaining := reliableRetryPeriod - now.Sub(packet.lastSent)
+		if remaining < 0 {
+			remaining = 0
+		}
+		if remaining < fallback {
+			fallback = remaining
+		}
+	}
+	return fallback
 }
 
 func stopTimer(timer *time.Timer) {

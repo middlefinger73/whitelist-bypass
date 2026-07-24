@@ -22,6 +22,16 @@ type creatorUDP struct {
 	socks  *common.Socks5UDPSession
 }
 
+func tuneTCPConn(conn net.Conn) {
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tcp.SetNoDelay(true)
+	_ = tcp.SetKeepAlive(true)
+	_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+}
+
 func (c *creatorUDP) writePacket(data []byte, dst string) error {
 	if c.socks != nil {
 		return c.socks.WriteTo(data, dst)
@@ -481,6 +491,7 @@ func (rb *RelayBridge) connectTCP(connID uint32, addr string) {
 		rb.send(connID, MsgConnectErr, []byte(common.MaskError(err)))
 		return
 	}
+	tuneTCPConn(conn)
 	rb.conns.Store(connID, conn)
 	rb.send(connID, MsgConnectOK, nil)
 	rb.logFn("relay: CONNECTED %d -> %s", connID, common.MaskAddr(addr))
@@ -555,6 +566,7 @@ func (rb *RelayBridge) handleSOCKS(conn net.Conn) {
 		conn.Close()
 		return
 	}
+	tuneTCPConn(conn)
 	buf := make([]byte, common.HandshakeBuf)
 	n, err := conn.Read(buf)
 	if err != nil || n < 2 || buf[0] != common.Ver {

@@ -167,6 +167,11 @@ func (u *Socks5Upstream) DialTCP(dst string, timeout time.Duration) (net.Conn, e
 		return nil, err
 	}
 	conn.SetDeadline(time.Time{})
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+	}
 	return conn, nil
 }
 

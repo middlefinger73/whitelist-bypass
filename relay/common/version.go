@@ -5,7 +5,7 @@ import (
 	"os"
 )
 
-const Version = "0.3.21-idlecpu2"
+const Version = "0.3.22-tcpbatch10"
 
 func MaybePrintVersion() {
 	for _, arg := range os.Args[1:] {

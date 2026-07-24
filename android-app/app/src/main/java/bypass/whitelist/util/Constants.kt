@@ -73,7 +73,7 @@ object PrefsKeys {
 
 object VP8Defaults {
     const val FPS = 24
-    const val BATCH = 30
+    const val BATCH = 10
 }
 
 const val BLANK_URL = "about:blank"
