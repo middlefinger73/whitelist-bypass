@@ -71,7 +71,7 @@ type Bridge struct {
 	slotRecovering  bool
 }
 
-const publisherRotationPeriod = 2 * time.Minute
+const publisherRotationPeriod = 35 * time.Second
 
 func tmRequest(method, path string, body interface{}, cookieStr string, cfg TMConfig) ([]byte, int, error) {
 	c := tmapi.Client{Cookie: cookieStr, AppVersion: cfg.AppVersion, InstanceID: clientInstanceID}

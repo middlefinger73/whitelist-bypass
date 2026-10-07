@@ -27,7 +27,7 @@ const (
 	TmPingPeriod                    = 5 * time.Second
 	telemostReconnectInitialDelay   = time.Second
 	telemostReconnectMaxDelay       = 16 * time.Second
-	telemostPublisherRotationPeriod = 2 * time.Minute
+	telemostPublisherRotationPeriod = 35 * time.Second
 )
 
 type TelemostHeadlessJoiner struct {
