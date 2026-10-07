@@ -22,12 +22,12 @@ import (
 )
 
 const (
-	TmAPIBase                     = tmapi.APIBase
-	TmOrigin                      = tmapi.Origin
-	TmPingPeriod                  = 5 * time.Second
-	telemostReconnectInitialDelay = time.Second
-	telemostReconnectMaxDelay     = 16 * time.Second
-	telemostPublisherRotationPeriod = 35 * time.Second
+	TmAPIBase                       = tmapi.APIBase
+	TmOrigin                        = tmapi.Origin
+	TmPingPeriod                    = 5 * time.Second
+	telemostReconnectInitialDelay   = time.Second
+	telemostReconnectMaxDelay       = 16 * time.Second
+	telemostPublisherRotationPeriod = 2 * time.Minute
 )
 
 type TelemostHeadlessJoiner struct {
@@ -39,11 +39,11 @@ type TelemostHeadlessJoiner struct {
 	// joiner uses these to install /32 bypass routes before the
 	// candidate is added to Pion's PeerConnection.
 	OnRemoteCandidate func(target int, candidateOrSDP string)
-	ResolveFn      ResolveFunc
-	Status         StatusEmitter
-	PCConfig       PeerConnectionConfigurer
-	AddTracks      AddTunnelTracksFunc
-	ReadTrackFn    ReadTrackFunc
+	ResolveFn         ResolveFunc
+	Status            StatusEmitter
+	PCConfig          PeerConnectionConfigurer
+	AddTracks         AddTunnelTracksFunc
+	ReadTrackFn       ReadTrackFunc
 
 	joinLink    string
 	displayName string
@@ -56,12 +56,12 @@ type TelemostHeadlessJoiner struct {
 	subRemoteSet bool
 	subPending   []webrtc.ICECandidateInit
 
-	pubPC        *webrtc.PeerConnection
-	pubSeq       atomic.Int32
-	pubRemoteSet bool
-	pubPending   []webrtc.ICECandidateInit
-	pubSignalMu  sync.Mutex
-	pubRotateMu  sync.Mutex
+	pubPC         *webrtc.PeerConnection
+	pubSeq        atomic.Int32
+	pubRemoteSet  bool
+	pubPending    []webrtc.ICECandidateInit
+	pubSignalMu   sync.Mutex
+	pubRotateMu   sync.Mutex
 	pubRotateStop chan struct{}
 	pubRotateOn   bool
 	pcAPI         *webrtc.API
@@ -411,13 +411,13 @@ func (j *TelemostHeadlessJoiner) sendHello() {
 		"hello": map[string]interface{}{
 			"participantMeta":       map[string]interface{}{"name": j.displayName, "role": "SPEAKER", "description": "", "sendAudio": false, "sendVideo": true},
 			"participantAttributes": map[string]interface{}{"name": j.displayName, "role": "SPEAKER", "description": ""},
-			"sendAudio": false, "sendVideo": true, "sendSharing": false,
+			"sendAudio":             false, "sendVideo": true, "sendSharing": false,
 			"participantId": j.peerID, "roomId": j.roomID,
 			"serviceName": j.serviceName, "credentials": j.credentials,
-			"capabilitiesOffer": tmapi.CapabilitiesOffer,
+			"capabilitiesOffer":   tmapi.CapabilitiesOffer,
 			"sdkInfo":             map[string]interface{}{"implementation": "browser", "version": "6.0.0", "userAgent": common.UserAgent, "hwConcurrency": 8},
 			"sdkInitializationId": uuid.New().String(),
-			"disablePublisher": false, "disableSubscriber": false, "disableSubscriberAudio": false,
+			"disablePublisher":    false, "disableSubscriber": false, "disableSubscriberAudio": false,
 		},
 	})
 	j.logFn("telemost-joiner: -> hello")

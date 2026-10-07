@@ -99,6 +99,25 @@ func TestReliablePacketIsRetransmitted(t *testing.T) {
 	}
 }
 
+func TestReliableRetryDelayBacksOffAndCaps(t *testing.T) {
+	tests := []struct {
+		attempts int
+		want     time.Duration
+	}{
+		{attempts: 1, want: 500 * time.Millisecond},
+		{attempts: 2, want: time.Second},
+		{attempts: 3, want: 2 * time.Second},
+		{attempts: 4, want: 4 * time.Second},
+		{attempts: 5, want: 8 * time.Second},
+		{attempts: 20, want: 8 * time.Second},
+	}
+	for _, test := range tests {
+		if got := reliableRetryDelay(test.attempts); got != test.want {
+			t.Fatalf("attempts %d delay = %s, want %s", test.attempts, got, test.want)
+		}
+	}
+}
+
 func TestReliableSendAssignsOrderedSequenceNumbers(t *testing.T) {
 	tun := newReliableTestTunnel(t)
 	tun.SendData([]byte("one"))
@@ -154,5 +173,19 @@ func TestReliableDisconnectClearsAndStopsTraffic(t *testing.T) {
 	_, seq, body, ok := decodeReliablePacket(packet)
 	if !ok || seq != 1 || string(body) != "fresh" {
 		t.Fatalf("first packet after reconnect: ok=%v seq=%d body=%q", ok, seq, body)
+	}
+}
+
+func TestRemainingPacingDelay(t *testing.T) {
+	now := time.Unix(100, 0)
+
+	if got := remainingPacingDelay(now, time.Time{}); got != 0 {
+		t.Fatalf("zero deadline delay = %s, want 0", got)
+	}
+	if got := remainingPacingDelay(now, now.Add(-time.Millisecond)); got != 0 {
+		t.Fatalf("expired deadline delay = %s, want 0", got)
+	}
+	if got := remainingPacingDelay(now, now.Add(4*time.Millisecond)); got != 4*time.Millisecond {
+		t.Fatalf("future deadline delay = %s, want 4ms", got)
 	}
 }

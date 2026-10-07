@@ -45,7 +45,7 @@ jobs:
           mkdir -p artifacts
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go -C headless/telemost build \
             -trimpath -ldflags='-s -w' \
-            -o ../../artifacts/headless-telemost-creator-slotfix .
+            -o ../../artifacts/headless-telemost-creator-0.3.25-backoff .
 
       - name: Build Android relay
         run: |
@@ -63,12 +63,12 @@ jobs:
 
       - name: Build Android APK
         run: |
-          sed -i 's/val versionPatch = 6/val versionPatch = 22/' android-app/app/build.gradle.kts
+          sed -i 's/val versionPatch = 6/val versionPatch = 25/' android-app/app/build.gradle.kts
           cd android-app
           chmod +x gradlew
           ./gradlew assembleRelease
           cp app/build/outputs/apk/release/app-release.apk \
-            ../artifacts/whitelist-bypass-0.3.22-tcpbatch10.apk
+            ../artifacts/whitelist-bypass-0.3.25-backoff.apk
 
       - uses: actions/upload-artifact@v4
         with:

@@ -17,6 +17,7 @@ const (
 	keyframePeriod      = 30 * time.Second
 	sendQueueDepth      = 128
 	reliableRetryPeriod = 500 * time.Millisecond
+	reliableRetryMax    = 8 * time.Second
 	reliableAckPeriod   = 20 * time.Millisecond
 	reliableWindowSize  = 1024
 	reliableAckMapBytes = reliableWindowSize / 8
@@ -98,7 +99,7 @@ func (t *VP8DataTunnel) ResumeTrack() {
 }
 
 func (t *VP8DataTunnel) SetOnData(fn func([]byte)) { t.OnData = fn }
-func (t *VP8DataTunnel) SetOnClose(fn func())       { t.OnClose = fn }
+func (t *VP8DataTunnel) SetOnClose(fn func())      { t.OnClose = fn }
 
 // EnableReliableDelivery adds ordered delivery, cumulative acknowledgements,
 // and retransmission to the lossy VP8 media transport. Both peers must enable it.
@@ -265,6 +266,7 @@ func (t *VP8DataTunnel) writerLoop() {
 		forcedKeyframes := 0
 		reconfigure := false
 		nextDelay := time.Duration(0)
+		nextWriteAt := time.Time{}
 
 		for !reconfigure {
 			if nextDelay < 0 {
@@ -289,6 +291,10 @@ func (t *VP8DataTunnel) writerLoop() {
 			}
 			var sample []byte
 			now := time.Now()
+			if delay := remainingPacingDelay(now, nextWriteAt); delay > 0 {
+				nextDelay = delay
+				continue
+			}
 			forceKeyframe := lastKeyframe.IsZero() || now.Sub(lastKeyframe) >= keyframePeriod
 			if forceKeyframe {
 				sample = vp8VideoKeyframe
@@ -321,6 +327,7 @@ func (t *VP8DataTunnel) writerLoop() {
 				t.logFn("vp8tunnel: WriteSample error: %v", err)
 				continue
 			}
+			nextWriteAt = time.Now().Add(sampleInterval)
 			n := t.sentFrames.Add(1)
 			if forceKeyframe && (forcedKeyframes <= 3 || forcedKeyframes%30 == 0) {
 				t.logFn("vp8tunnel: forced keyframe #%d at frame #%d", forcedKeyframes, n)
@@ -336,6 +343,13 @@ func (t *VP8DataTunnel) writerLoop() {
 	}
 }
 
+func remainingPacingDelay(now, nextWriteAt time.Time) time.Duration {
+	if nextWriteAt.IsZero() || !now.Before(nextWriteAt) {
+		return 0
+	}
+	return nextWriteAt.Sub(now)
+}
+
 // nextIdleDelay lets pending reliable packets wake the writer before the
 // keepalive deadline. This keeps recovery latency below one second without
 // bringing back the old high-frequency idle ticker.
@@ -346,7 +360,7 @@ func (t *VP8DataTunnel) nextIdleDelay(now time.Time, fallback time.Duration) tim
 	t.pendingMu.Lock()
 	defer t.pendingMu.Unlock()
 	for _, packet := range t.pending {
-		remaining := reliableRetryPeriod - now.Sub(packet.lastSent)
+		remaining := reliableRetryDelay(packet.attempts) - now.Sub(packet.lastSent)
 		if remaining < 0 {
 			remaining = 0
 		}
@@ -443,7 +457,7 @@ func (t *VP8DataTunnel) nextOutboundData(now time.Time) []byte {
 	var retrySeq uint32
 	var retry *reliablePendingPacket
 	for seq, packet := range t.pending {
-		if now.Sub(packet.lastSent) < reliableRetryPeriod {
+		if now.Sub(packet.lastSent) < reliableRetryDelay(packet.attempts) {
 			continue
 		}
 		if retry == nil || packet.lastSent.Before(retry.lastSent) {
@@ -480,6 +494,17 @@ func (t *VP8DataTunnel) nextOutboundData(now time.Time) []byte {
 	default:
 		return nil
 	}
+}
+
+func reliableRetryDelay(attempts int) time.Duration {
+	delay := reliableRetryPeriod
+	for i := 1; i < attempts && delay < reliableRetryMax; i++ {
+		delay *= 2
+		if delay >= reliableRetryMax {
+			return reliableRetryMax
+		}
+	}
+	return delay
 }
 
 func (t *VP8DataTunnel) handleReliableAck(ack uint32, bitmap []byte) {

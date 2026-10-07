@@ -61,17 +61,17 @@ type Bridge struct {
 	pubMu         sync.Mutex
 	pubRotateStop chan struct{}
 
-	setSlotsKey    int
-	initBundleSent bool
-	pendingKicks   map[string]chan struct{}
-	boundPeers     map[string]bool
-	unboundPeers   map[string]bool
+	setSlotsKey     int
+	initBundleSent  bool
+	pendingKicks    map[string]chan struct{}
+	boundPeers      map[string]bool
+	unboundPeers    map[string]bool
 	slotMu          sync.Mutex
 	slotRecoveryGen uint64
 	slotRecovering  bool
 }
 
-const publisherRotationPeriod = 35 * time.Second
+const publisherRotationPeriod = 2 * time.Minute
 
 func tmRequest(method, path string, body interface{}, cookieStr string, cfg TMConfig) ([]byte, int, error) {
 	c := tmapi.Client{Cookie: cookieStr, AppVersion: cfg.AppVersion, InstanceID: clientInstanceID}
