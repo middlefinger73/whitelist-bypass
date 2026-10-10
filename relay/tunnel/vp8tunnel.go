@@ -48,11 +48,12 @@ type VP8DataTunnel struct {
 	cfgChan   chan struct{}
 	wakeCh    chan struct{}
 
-	stopOnce sync.Once
-	running  atomic.Bool
-	paused   atomic.Bool
-	reliable atomic.Bool
-	peerUp   atomic.Bool
+	stopOnce      sync.Once
+	running       atomic.Bool
+	paused        atomic.Bool
+	reliable      atomic.Bool
+	peerUp        atomic.Bool
+	forceKeyframe atomic.Bool
 
 	cfgMu sync.Mutex
 	fps   int
@@ -89,7 +90,11 @@ func (t *VP8DataTunnel) SetTrack(track *webrtc.TrackLocalStaticSample) {
 	t.trackMu.Lock()
 	t.track = track
 	t.trackMu.Unlock()
+	// A new RTP stream must start with a keyframe, even if the previous stream
+	// sent one recently. Otherwise the SFU can discard its delta frames.
+	t.forceKeyframe.Store(true)
 	t.paused.Store(false)
+	t.wakeWriter()
 	t.logFn("vp8tunnel: publisher track rotated")
 }
 
@@ -303,7 +308,7 @@ func (t *VP8DataTunnel) writerLoop() {
 				nextDelay = delay
 				continue
 			}
-			forceKeyframe := lastKeyframe.IsZero() || now.Sub(lastKeyframe) >= keyframePeriod
+			forceKeyframe := t.forceKeyframe.Swap(false) || lastKeyframe.IsZero() || now.Sub(lastKeyframe) >= keyframePeriod
 			if forceKeyframe {
 				sample = vp8VideoKeyframe
 				lastKeyframe = now

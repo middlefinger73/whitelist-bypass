@@ -41,6 +41,7 @@ jobs:
             relay/tunnel/vp8tunnel_reliable_test.go headless/telemost/config.go \
             headless/telemost/config_test.go headless/telemost/tunnel_relay.go
           gofmt -w relay/tunnel/vp8tunnel_stats.go relay/tunnel/vp8tunnel_stats_test.go relay/tunnel/vp8tunnel_fastack_test.go
+          gofmt -w relay/tunnel/vp8tunnel_rotation_test.go
           go -C relay test ./...
           go -C headless/telemost test ./...
           git diff --check
@@ -50,7 +51,7 @@ jobs:
           mkdir -p artifacts
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go -C headless/telemost build \
             -trimpath -ldflags='-s -w' \
-            -o ../../artifacts/headless-telemost-creator-0.3.29-fastack .
+            -o ../../artifacts/headless-telemost-creator-0.3.30-rotatekey .
 
       - name: Build Android relay
         run: |
@@ -68,12 +69,12 @@ jobs:
 
       - name: Build Android APK
         run: |
-          sed -i 's/val versionPatch = 6/val versionPatch = 29/' android-app/app/build.gradle.kts
+          sed -i 's/val versionPatch = 6/val versionPatch = 30/' android-app/app/build.gradle.kts
           cd android-app
           chmod +x gradlew
           ./gradlew assembleRelease
           cp app/build/outputs/apk/release/app-release.apk \
-            ../artifacts/whitelist-bypass-0.3.29-fastack.apk
+            ../artifacts/whitelist-bypass-0.3.30-rotatekey.apk
 
       - uses: actions/upload-artifact@v4
         with:
