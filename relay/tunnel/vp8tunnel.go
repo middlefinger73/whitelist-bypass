@@ -11,27 +11,31 @@ import (
 )
 
 const (
-	defaultVP8FPS       = 24
-	defaultVP8Batch     = 10
-	keepaliveIdlePeriod = time.Second
-	keyframePeriod      = 30 * time.Second
-	sendQueueDepth      = 128
-	reliableRetryPeriod = 500 * time.Millisecond
-	reliableRetryMax    = 8 * time.Second
-	reliableAckPeriod   = 20 * time.Millisecond
-	reliableWindowSize  = 1024
-	reliableAckMapBytes = reliableWindowSize / 8
-	reliableHeaderLen   = 9
-	reliableMagic       = 0x57425231 // WBR1
-	reliableKindData    = 1
-	reliableKindAck     = 2
+	defaultVP8FPS        = 24
+	defaultVP8Batch      = 10
+	keepaliveIdlePeriod  = time.Second
+	keyframePeriod       = 30 * time.Second
+	sendQueueDepth       = 128
+	reliableRetryPeriod  = 500 * time.Millisecond
+	reliableRetryMax     = 8 * time.Second
+	reliableFastRetryMin = 250 * time.Millisecond
+	reliableGapReports   = 3
+	reliableAckPeriod    = 20 * time.Millisecond
+	reliableWindowSize   = 1024
+	reliableAckMapBytes  = reliableWindowSize / 8
+	reliableHeaderLen    = 9
+	reliableMagic        = 0x57425231 // WBR1
+	reliableKindData     = 1
+	reliableKindAck      = 2
 )
 
 type reliablePendingPacket struct {
-	data      []byte
-	firstSent time.Time
-	lastSent  time.Time
-	attempts  int
+	data       []byte
+	firstSent  time.Time
+	lastSent   time.Time
+	attempts   int
+	gapReports int
+	gapHigh    uint32
 }
 
 type VP8DataTunnel struct {
@@ -364,7 +368,7 @@ func (t *VP8DataTunnel) nextIdleDelay(now time.Time, fallback time.Duration) tim
 	t.pendingMu.Lock()
 	defer t.pendingMu.Unlock()
 	for _, packet := range t.pending {
-		remaining := reliableRetryDelay(packet.attempts) - now.Sub(packet.lastSent)
+		remaining := packet.retryDelay() - now.Sub(packet.lastSent)
 		if remaining < 0 {
 			remaining = 0
 		}
@@ -461,7 +465,7 @@ func (t *VP8DataTunnel) nextOutboundData(now time.Time) []byte {
 	var retrySeq uint32
 	var retry *reliablePendingPacket
 	for seq, packet := range t.pending {
-		if now.Sub(packet.lastSent) < reliableRetryDelay(packet.attempts) {
+		if now.Sub(packet.lastSent) < packet.retryDelay() {
 			continue
 		}
 		if retry == nil || packet.lastSent.Before(retry.lastSent) {
@@ -469,6 +473,10 @@ func (t *VP8DataTunnel) nextOutboundData(now time.Time) []byte {
 		}
 	}
 	if retry != nil {
+		if retry.gapReports >= reliableGapReports && now.Sub(retry.lastSent) < reliableRetryDelay(retry.attempts) {
+			t.stats.fastRetries++
+		}
+		retry.gapReports = 0
 		retry.lastSent = now
 		retry.attempts++
 		t.stats.retries++
@@ -520,6 +528,13 @@ func reliableRetryDelay(attempts int) time.Duration {
 	return delay
 }
 
+func (p *reliablePendingPacket) retryDelay() time.Duration {
+	if p.gapReports >= reliableGapReports {
+		return reliableFastRetryMin
+	}
+	return reliableRetryDelay(p.attempts)
+}
+
 func (t *VP8DataTunnel) handleReliableAck(ack uint32, bitmap []byte) {
 	t.handleReliableAckAt(ack, bitmap, time.Now())
 }
@@ -527,6 +542,19 @@ func (t *VP8DataTunnel) handleReliableAck(ack uint32, bitmap []byte) {
 func (t *VP8DataTunnel) handleReliableAckAt(ack uint32, bitmap []byte, now time.Time) {
 	t.pendingMu.Lock()
 	t.stats.ackMessages++
+	// Only acknowledgements of packets actually pending here provide gap evidence.
+	// Advancing high-water marks avoid counting duplicated ACKs as new evidence.
+	highest := ack
+	for seq := range t.pending {
+		if seq <= ack {
+			continue
+		}
+		offset := seq - ack - 1
+		index := int(offset / 8)
+		if index < len(bitmap) && bitmap[index]&(1<<uint(offset%8)) != 0 && seq > highest {
+			highest = seq
+		}
+	}
 	for seq, packet := range t.pending {
 		if seq <= ack {
 			t.stats.recordAck(packet, now)
@@ -539,9 +567,17 @@ func (t *VP8DataTunnel) handleReliableAckAt(ack uint32, bitmap []byte, now time.
 		if byteIndex < len(bitmap) && bitmap[byteIndex]&(1<<bitIndex) != 0 {
 			t.stats.recordAck(packet, now)
 			delete(t.pending, seq)
+			continue
+		}
+		if seq < highest && highest > packet.gapHigh {
+			packet.gapHigh = highest
+			if packet.gapReports < reliableGapReports {
+				packet.gapReports++
+			}
 		}
 	}
 	t.pendingMu.Unlock()
+	t.wakeWriter()
 }
 
 func (t *VP8DataTunnel) handleReliableData(seq uint32, payload []byte) {

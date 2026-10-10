@@ -5,7 +5,7 @@ import (
 	"os"
 )
 
-const Version = "0.3.28-ackstats"
+const Version = "0.3.29-fastack"
 
 func MaybePrintVersion() {
 	for _, arg := range os.Args[1:] {

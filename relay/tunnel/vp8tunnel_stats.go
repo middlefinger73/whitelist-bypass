@@ -3,6 +3,7 @@ package tunnel
 import "time"
 
 type reliableTransportStats struct {
+	fastRetries                                                         uint64
 	sent, sentBytes, retries, retryBytes, ackMessages, acked, discarded uint64
 	retryAttempts                                                       [4]uint64 // Attempts 2, 3, 4, and 5 or higher.
 	ackDelayCount                                                       uint64
@@ -69,8 +70,8 @@ func (t *VP8DataTunnel) logReliableStats(now time.Time) {
 	if s.sent+s.retries+s.ackMessages+s.discarded == 0 && pending == 0 {
 		return
 	}
-	t.logFn("vp8tunnel: stats interval_s=%.1f new=%d new_bytes=%d retries=%d retry_bytes=%d attempt2=%d attempt3=%d attempt4=%d attempt5plus=%d ack_messages=%d acked=%d discarded=%d pending=%d oldest_ms=%.1f ack_delay_n=%d ack_delay_avg_ms=%.1f ack_delay_max_ms=%.1f rtt_clean_n=%d rtt_clean_avg_ms=%.1f rtt_clean_max_ms=%.1f",
-		elapsed.Seconds(), s.sent, s.sentBytes, s.retries, s.retryBytes,
+	t.logFn("vp8tunnel: stats interval_s=%.1f new=%d new_bytes=%d retries=%d retry_bytes=%d fast_retries=%d attempt2=%d attempt3=%d attempt4=%d attempt5plus=%d ack_messages=%d acked=%d discarded=%d pending=%d oldest_ms=%.1f ack_delay_n=%d ack_delay_avg_ms=%.1f ack_delay_max_ms=%.1f rtt_clean_n=%d rtt_clean_avg_ms=%.1f rtt_clean_max_ms=%.1f",
+		elapsed.Seconds(), s.sent, s.sentBytes, s.retries, s.retryBytes, s.fastRetries,
 		s.retryAttempts[0], s.retryAttempts[1], s.retryAttempts[2], s.retryAttempts[3],
 		s.ackMessages, s.acked, s.discarded, pending, float64(oldest)/float64(time.Millisecond),
 		s.ackDelayCount, meanMilliseconds(s.ackDelayTotal, s.ackDelayCount), float64(s.ackDelayMax)/float64(time.Millisecond),
