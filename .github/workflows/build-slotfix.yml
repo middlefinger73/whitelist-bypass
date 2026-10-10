@@ -40,7 +40,9 @@ jobs:
             relay/tunnel/vp8tunnel.go relay/tunnel/vp8tunnel_legacy.go relay/common/version.go \
             relay/tunnel/vp8tunnel_reliable_test.go headless/telemost/config.go \
             headless/telemost/config_test.go headless/telemost/tunnel_relay.go
+          gofmt -w relay/tunnel/vp8tunnel_stats.go relay/tunnel/vp8tunnel_stats_test.go
           go -C relay test ./...
+          go -C headless/telemost test ./...
           git diff --check
 
       - name: Build Linux creator
@@ -48,7 +50,7 @@ jobs:
           mkdir -p artifacts
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go -C headless/telemost build \
             -trimpath -ldflags='-s -w' \
-            -o ../../artifacts/headless-telemost-creator-0.3.27-sdk6 .
+            -o ../../artifacts/headless-telemost-creator-0.3.28-ackstats .
 
       - name: Build Android relay
         run: |
@@ -66,12 +68,12 @@ jobs:
 
       - name: Build Android APK
         run: |
-          sed -i 's/val versionPatch = 6/val versionPatch = 27/' android-app/app/build.gradle.kts
+          sed -i 's/val versionPatch = 6/val versionPatch = 28/' android-app/app/build.gradle.kts
           cd android-app
           chmod +x gradlew
           ./gradlew assembleRelease
           cp app/build/outputs/apk/release/app-release.apk \
-            ../artifacts/whitelist-bypass-0.3.27-sdk6.apk
+            ../artifacts/whitelist-bypass-0.3.28-ackstats.apk
 
       - uses: actions/upload-artifact@v4
         with:

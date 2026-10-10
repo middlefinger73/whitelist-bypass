@@ -28,9 +28,10 @@ const (
 )
 
 type reliablePendingPacket struct {
-	data     []byte
-	lastSent time.Time
-	attempts int
+	data      []byte
+	firstSent time.Time
+	lastSent  time.Time
+	attempts  int
 }
 
 type VP8DataTunnel struct {
@@ -62,6 +63,8 @@ type VP8DataTunnel struct {
 	nextSendSeq    uint32
 	pendingMu      sync.Mutex
 	pending        map[uint32]*reliablePendingPacket
+	stats          reliableTransportStats // Guarded by pendingMu.
+	statsSince     time.Time
 	recvMu         sync.Mutex
 	nextRecvSeq    uint32
 	recvPending    map[uint32][]byte
@@ -285,6 +288,7 @@ func (t *VP8DataTunnel) writerLoop() {
 				stopTimer(timer)
 			case <-timer.C:
 			}
+			t.logReliableStats(time.Now())
 			if t.paused.Load() {
 				nextDelay = keepaliveIdlePeriod
 				continue
@@ -467,6 +471,13 @@ func (t *VP8DataTunnel) nextOutboundData(now time.Time) []byte {
 	if retry != nil {
 		retry.lastSent = now
 		retry.attempts++
+		t.stats.retries++
+		t.stats.retryBytes += uint64(len(retry.data))
+		bucket := retry.attempts - 2
+		if bucket > 3 {
+			bucket = 3
+		}
+		t.stats.retryAttempts[bucket]++
 		data := retry.data
 		attempts := retry.attempts
 		t.pendingMu.Unlock()
@@ -488,7 +499,9 @@ func (t *VP8DataTunnel) nextOutboundData(now time.Time) []byte {
 			return nil
 		}
 		t.pendingMu.Lock()
-		t.pending[seq] = &reliablePendingPacket{data: data, lastSent: now, attempts: 1}
+		t.pending[seq] = &reliablePendingPacket{data: data, firstSent: now, lastSent: now, attempts: 1}
+		t.stats.sent++
+		t.stats.sentBytes += uint64(len(data))
 		t.pendingMu.Unlock()
 		return data
 	default:
@@ -508,9 +521,15 @@ func reliableRetryDelay(attempts int) time.Duration {
 }
 
 func (t *VP8DataTunnel) handleReliableAck(ack uint32, bitmap []byte) {
+	t.handleReliableAckAt(ack, bitmap, time.Now())
+}
+
+func (t *VP8DataTunnel) handleReliableAckAt(ack uint32, bitmap []byte, now time.Time) {
 	t.pendingMu.Lock()
-	for seq := range t.pending {
+	t.stats.ackMessages++
+	for seq, packet := range t.pending {
 		if seq <= ack {
+			t.stats.recordAck(packet, now)
 			delete(t.pending, seq)
 			continue
 		}
@@ -518,6 +537,7 @@ func (t *VP8DataTunnel) handleReliableAck(ack uint32, bitmap []byte) {
 		byteIndex := int(offset / 8)
 		bitIndex := uint(offset % 8)
 		if byteIndex < len(bitmap) && bitmap[byteIndex]&(1<<bitIndex) != 0 {
+			t.stats.recordAck(packet, now)
 			delete(t.pending, seq)
 		}
 	}
@@ -604,6 +624,7 @@ func (t *VP8DataTunnel) resetReliablePeerLocked() {
 	t.outboundMu.Lock()
 	t.pendingMu.Lock()
 	t.nextSendSeq = 1
+	t.stats.discarded += uint64(len(t.pending))
 	clear(t.pending)
 	for {
 		select {
