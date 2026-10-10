@@ -81,6 +81,16 @@ func fetchConfig() (TMConfig, error) {
 		return cfg, fmt.Errorf("failed to fetch bundle: %w", err)
 	}
 
+	cfg.SDKVersion = extractSDKVersion(bundle)
+	if cfg.SDKVersion == "" {
+		return cfg, fmt.Errorf("goloom SDK version not found in bundle")
+	}
+
+	log.Printf("[config] app=%s sdk=%s", cfg.AppVersion, cfg.SDKVersion)
+	return cfg, nil
+}
+
+func extractSDKVersion(bundle []byte) string {
 	sdkVerPatterns := []*regexp.Regexp{
 		regexp.MustCompile(`goloom_sdk_version:"(\d+\.\d+\.\d+)"`),
 		regexp.MustCompile(`"@yandex-video-platform/goloom-sdk":"(\d+\.\d+\.\d+)"`),
@@ -89,14 +99,19 @@ func fetchConfig() (TMConfig, error) {
 	}
 	for _, re := range sdkVerPatterns {
 		if m := re.FindSubmatch(bundle); m != nil {
-			cfg.SDKVersion = string(m[1])
-			break
+			return string(m[1])
 		}
 	}
-	if cfg.SDKVersion == "" {
-		return cfg, fmt.Errorf("goloom SDK version not found in bundle")
+
+	// New Messenger bundles embed Goloom directly and expose its build metadata
+	// through the same object used to populate sdkInfo.version.
+	metadataRe := regexp.MustCompile(`(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)=\{version:"([0-9]+\.[0-9]+\.[0-9]+)",date:"[^"]+"\}`)
+	for _, match := range metadataRe.FindAllSubmatch(bundle, -1) {
+		usageRe := regexp.MustCompile(`version:\s*` + regexp.QuoteMeta(string(match[1])) + `\.version\s*,\s*userAgent:`)
+		if usageRe.Match(bundle) {
+			return string(match[2])
+		}
 	}
 
-	log.Printf("[config] app=%s sdk=%s", cfg.AppVersion, cfg.SDKVersion)
-	return cfg, nil
+	return ""
 }

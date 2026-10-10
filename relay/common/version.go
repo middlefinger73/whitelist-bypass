@@ -5,7 +5,7 @@ import (
 	"os"
 )
 
-const Version = "0.3.26-backoff35"
+const Version = "0.3.27-sdk6"
 
 func MaybePrintVersion() {
 	for _, arg := range os.Args[1:] {
