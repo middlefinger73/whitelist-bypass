@@ -5,7 +5,7 @@ import (
 	"os"
 )
 
-const Version = "0.3.30-rotatekey"
+const Version = "0.3.31-reconnectepoch"
 
 func MaybePrintVersion() {
 	for _, arg := range os.Args[1:] {

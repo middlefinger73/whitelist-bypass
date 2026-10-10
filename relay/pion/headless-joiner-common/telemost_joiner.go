@@ -130,17 +130,10 @@ func (j *TelemostHeadlessJoiner) RunWithParams(jsonParams string) {
 	if j.displayName == "" {
 		j.displayName = "Joiner"
 	}
-	obf, err := tunnel.NewTunnelObfuscator(tunnel.DeriveSecretFromJoinLink(params.JoinLink))
-	if err != nil {
-		j.logFn("telemost-joiner: obfuscator init failed: %v", err)
-		j.Status.EmitStatusError("obfuscator init: " + err.Error())
-		return
-	}
-	j.obf = obf
 	j.vp8FPS = params.VP8FPS
 	j.vp8Batch = params.VP8Batch
-	j.logFn("telemost-joiner: link=%s name=%s vp8Fps=%d vp8Batch=%d localEpoch=0x%08x",
-		j.joinLink, j.displayName, params.VP8FPS, params.VP8Batch, obf.LocalEpoch())
+	j.logFn("telemost-joiner: link=%s name=%s vp8Fps=%d vp8Batch=%d",
+		j.joinLink, j.displayName, params.VP8FPS, params.VP8Batch)
 
 	j.Status.EmitStatus(common.StatusConnecting)
 	if err := j.runOnce(); err != nil {
@@ -170,10 +163,25 @@ func (j *TelemostHeadlessJoiner) RunWithParams(jsonParams string) {
 }
 
 func (j *TelemostHeadlessJoiner) runOnce() error {
+	if err := j.refreshSessionObfuscator(); err != nil {
+		return fmt.Errorf("obfuscator init: %w", err)
+	}
 	if err := j.getConnection(); err != nil {
 		return err
 	}
 	j.connectAndRun()
+	return nil
+}
+
+func (j *TelemostHeadlessJoiner) refreshSessionObfuscator() error {
+	// A new reliable tunnel restarts sequence numbers; the creator must see
+	// a new epoch too. Publisher rotation keeps the existing tunnel and epoch.
+	obf, err := tunnel.NewTunnelObfuscator(tunnel.DeriveSecretFromJoinLink(j.joinLink))
+	if err != nil {
+		return err
+	}
+	j.obf = obf
+	j.logFn("telemost-joiner: new reliable session localEpoch=0x%08x", obf.LocalEpoch())
 	return nil
 }
 
